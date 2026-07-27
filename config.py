@@ -21,7 +21,7 @@ VALID_EXIT_TRIGGERS = frozenset({
 })
 
 # --- Claude decision engine ---------------------------------------------------
-CLAUDE_MODEL = "claude-sonnet-5"
+CLAUDE_MODEL = "claude-opus-5"
 # Each cycle returns a full review per open position plus any trades, so this
 # scales with position count — 2048 truncated mid-JSON at only 5 positions.
 CLAUDE_MAX_TOKENS = 8192
