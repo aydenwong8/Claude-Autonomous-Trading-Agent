@@ -10,9 +10,21 @@ MAX_POSITION_PCT = 0.15        # max 15% of portfolio per ticker
 MIN_CASH_BUFFER_PCT = 0.05     # keep at least 5% of equity in cash
 MAX_TRADES_PER_CYCLE = 5       # reject proposed trades beyond this count
 
+# Every sell must name which of these fired. Keeps exits auditable after the
+# fact and stops positions being closed on price drift alone.
+VALID_EXIT_TRIGGERS = frozenset({
+    "thesis_broken",    # the written case is no longer true
+    "target_hit",       # the case played out
+    "bad_news",         # new information materially damages the case
+    "no_longer_fits",   # better use of capital / no longer earns its place
+    "risk",             # position or portfolio risk management
+})
+
 # --- Claude decision engine ---------------------------------------------------
 CLAUDE_MODEL = "claude-sonnet-5"
-CLAUDE_MAX_TOKENS = 2048
+# Each cycle returns a full review per open position plus any trades, so this
+# scales with position count — 2048 truncated mid-JSON at only 5 positions.
+CLAUDE_MAX_TOKENS = 8192
 
 # --- Tradable universe (long-only, whitelisted US equities/ETFs) -------------
 WATCHLIST = [
@@ -22,8 +34,8 @@ WATCHLIST = [
     "AMGN", "AMP", "AMT", "AMZN", "ANET", "AON", "AOS", "APA", "APD", "APH",
     "APO", "APP", "APTV", "ARE", "ARES", "ARM", "ASML", "ATO", "AVB", "AVGO",
     "AVY", "AWK", "AXON", "AXP", "AZO", "BA", "BAC", "BALL", "BAX", "BBY",
-    "BDX", "BEN", "BF-B", "BG", "BIIB", "BKNG", "BKR", "BLDR", "BLK", "BMY",
-    "BNY", "BR", "BRK-B", "BRO", "BSX", "BX", "BXP", "C", "CAH", "CARR",
+    "BDX", "BEN", "BF.B", "BG", "BIIB", "BKNG", "BKR", "BLDR", "BLK", "BMY",
+    "BNY", "BR", "BRK.B", "BRO", "BSX", "BX", "BXP", "C", "CAH", "CARR",
     "CASY", "CAT", "CB", "CBOE", "CBRE", "CCEP", "CCI", "CCL", "CDNS", "CDW",
     "CEG", "CF", "CFG", "CHD", "CHRW", "CHTR", "CI", "CIEN", "CINF", "CL",
     "CLX", "CMCSA", "CME", "CMG", "CMI", "CMS", "CNC", "CNP", "COF", "COHR",

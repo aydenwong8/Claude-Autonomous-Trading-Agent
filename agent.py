@@ -57,12 +57,52 @@ class MarketContext:
 
 
 @dataclass
+class Thesis:
+    """The standing investment case for a held position.
+
+    Written by Claude when it opens a position and carried forward into every
+    later cycle's prompt, so the agent reasons against its own prior case
+    instead of re-deriving an opinion from scratch each day.
+    """
+    symbol: str
+    opened_at: str
+    thesis: str          # why we own it
+    target: str          # what would count as the case playing out
+    invalidation: str    # what would prove the case wrong
+    status: str = "open"  # "open" | "closed"
+    closed_at: str | None = None
+    exit_trigger: str | None = None
+
+
+@dataclass
+class PositionReview:
+    """Claude's daily verdict on one held position. Not a trade — a judgement.
+
+    Every open position must be reviewed each cycle, which is what makes a
+    no-trade day an active decision rather than an absence of one.
+    """
+    symbol: str
+    verdict: str  # "hold" | "trim" | "exit"
+    note: str
+    # Set when adopting a position that has no stored thesis yet (opened before
+    # thesis tracking, or outside the agent). Persisted as a new open thesis.
+    thesis: str | None = None
+    target: str | None = None
+    invalidation: str | None = None
+
+
+@dataclass
 class ProposedTrade:
     """A single trade proposed by Claude, before validation."""
     symbol: str
     side: str  # "buy" or "sell"
     notional_usd: float
     reasoning: str
+    # Buys must open a thesis; sells must name which exit trigger fired.
+    thesis: str | None = None
+    target: str | None = None
+    invalidation: str | None = None
+    exit_trigger: str | None = None
 
 
 @dataclass
@@ -176,6 +216,40 @@ trading agent. You propose trades; you do not execute them. Every proposal is ch
 by code against hard guardrails before anything is sent to the broker, so you must \
 still reason carefully, but do not assume your proposals will be accepted verbatim.
 
+YOUR MANDATE
+
+You are a thesis-driven swing investor, not a daily trader. You run once per day \
+after the close, but acting every day is not the goal and is usually a mistake. \
+Most days the correct output is zero trades. You are being measured on the quality \
+of your positions over weeks and months, not on activity.
+
+When you buy, you are opening an investment case. You must write down that case: \
+why you own it, what would count as it playing out, and what would prove you wrong. \
+That case is stored and shown back to you every subsequent day. You are accountable \
+to it.
+
+When you sell, it must be because a specific, nameable thing happened. Valid exit \
+triggers:
+- "thesis_broken"    — the case you wrote down is no longer true
+- "target_hit"       — the case played out; take the gain
+- "bad_news"         — new information materially damages the case
+- "no_longer_fits"   — better use of the capital, or the position no longer earns its place
+- "risk"             — position/portfolio risk management
+
+Do not sell because a position is merely down, and do not hold because it is merely \
+up. Price alone is not a thesis. Judge the case, not the P&L. Equally, do not let a \
+broken thesis sit just because you are not yet at a loss.
+
+DAILY REVIEW
+
+You must return a review verdict for EVERY open position, every cycle, even when you \
+propose no trades. This is the core of the job: re-read each stored thesis against \
+today's price and news, and state whether it still holds.
+- "hold" — case intact, no action
+- "trim" — case intact but position should be smaller (pair with a partial sell)
+- "exit" — case is done or broken (pair with a sell for the full position value)
+A "trim" or "exit" verdict must have a matching sell in "trades", or it is ignored.
+
 Guardrails your proposals will be checked against:
 - Max position size: 15% of portfolio equity per ticker (post-trade)
 - Universe: long-only, whitelisted US equities/ETFs only
@@ -185,28 +259,80 @@ Guardrails your proposals will be checked against:
 
 Respond with ONLY a single JSON object (no prose, no markdown fences) matching this shape:
 {
-  "trades": [
-    {"symbol": "AAPL", "side": "buy", "notional_usd": 1000.0, "reasoning": "..."}
+  "reviews": [
+    {"symbol": "AAPL", "verdict": "hold", "note": "why the stored thesis still holds, or why it doesn't"}
   ],
-  "commentary": "brief overall reasoning for this cycle, including a no-trade decision if empty"
+  "trades": [
+    {"symbol": "NVDA", "side": "buy", "notional_usd": 1000.0, "reasoning": "...",
+     "thesis": "the investment case in 1-3 sentences",
+     "target": "what playing out looks like — level, event, or condition",
+     "invalidation": "the specific thing that would prove this wrong"},
+    {"symbol": "AAPL", "side": "sell", "notional_usd": 500.0, "reasoning": "...",
+     "exit_trigger": "thesis_broken"}
+  ],
+  "commentary": "overall reasoning for the cycle, including why you are not trading if trades is empty"
 }
-"trades" may be an empty list if no action is warranted this cycle."""
+Buys REQUIRE thesis, target, and invalidation. Sells REQUIRE exit_trigger. Trades \
+missing these fields are rejected by code before reaching the broker.
+"trades" may be an empty list — and on most days it should be.
+
+ADOPTING AN UNTRACKED POSITION
+
+A position may appear with "thesis": null — opened before thesis tracking existed, \
+or outside the agent. Do not leave it untracked: either exit it, or adopt it by \
+returning its review with "verdict": "hold" plus "thesis", "target", and \
+"invalidation" fields alongside "note". Those are stored and shown back to you from \
+the next cycle onward. Writing the case only in "note" does NOT store it, and you \
+will be asked again tomorrow."""
 
 
-def build_decision_prompt(portfolio: PortfolioState, market: MarketContext) -> str:
+def build_decision_prompt(
+    portfolio: PortfolioState,
+    market: MarketContext,
+    theses: dict[str, Thesis],
+    as_of: datetime,
+) -> str:
     """Assemble the prompt sent to Claude, instructing it to return trades as
     structured JSON with written reasoning per trade.
+
+    Each held position is paired with the thesis Claude wrote when it opened
+    that position, plus unrealised P&L and days held, so the model reviews its
+    own standing case rather than forming a fresh opinion every cycle.
     """
-    positions_summary = [
-        {
+    positions_summary = []
+    for p in portfolio.positions.values():
+        current_price = market.prices.get(p.symbol)
+        entry = p.avg_entry_price
+        row = {
             "symbol": p.symbol,
             "qty": p.qty,
             "market_value": round(p.market_value, 2),
-            "avg_entry_price": round(p.avg_entry_price, 2),
+            "avg_entry_price": round(entry, 2),
+            "current_price": current_price,
+            "unrealized_pnl_pct": (
+                round((current_price - entry) / entry * 100, 2)
+                if current_price and entry else None
+            ),
             "pct_of_equity": round(p.market_value / portfolio.equity * 100, 2) if portfolio.equity else 0,
         }
-        for p in portfolio.positions.values()
-    ]
+        t = theses.get(p.symbol)
+        if t:
+            opened = datetime.fromisoformat(t.opened_at)
+            row["thesis"] = {
+                "opened_at": t.opened_at,
+                "days_held": (as_of - opened).days,
+                "why_we_own_it": t.thesis,
+                "target": t.target,
+                "invalidation": t.invalidation,
+            }
+        else:
+            # Pre-dates thesis tracking, or was opened outside the agent.
+            row["thesis"] = None
+            row["note"] = (
+                "No stored thesis for this position. Either write one by "
+                "reviewing it as 'hold' with a note stating the case, or exit it."
+            )
+        positions_summary.append(row)
 
     state = {
         "as_of": portfolio.timestamp.isoformat(),
@@ -220,14 +346,19 @@ def build_decision_prompt(portfolio: PortfolioState, market: MarketContext) -> s
     return (
         "Current portfolio and market state (JSON):\n"
         f"{json.dumps(state, indent=2)}\n\n"
-        "Decide on trades for this cycle, if any, per the instructions above."
+        "Review every open position against its stored thesis and return a verdict "
+        "for each. Then decide on trades for this cycle — including none, if none "
+        "are warranted."
     )
 
 
-def _parse_trades_response(raw_text: str) -> tuple[list[ProposedTrade], str]:
-    """Parse Claude's JSON response into ProposedTrade objects.
+def _parse_trades_response(
+    raw_text: str,
+) -> tuple[list[ProposedTrade], list[PositionReview], str]:
+    """Parse Claude's JSON response into ProposedTrade and PositionReview objects.
 
-    Returns the trades plus the raw response text (for logging).
+    Returns the trades, the per-position review verdicts, and the raw response
+    text (for logging).
     """
     text = raw_text.strip()
     if text.startswith("```"):
@@ -243,17 +374,34 @@ def _parse_trades_response(raw_text: str) -> tuple[list[ProposedTrade], str]:
             side=t["side"],
             notional_usd=float(t["notional_usd"]),
             reasoning=t.get("reasoning", ""),
+            thesis=t.get("thesis"),
+            target=t.get("target"),
+            invalidation=t.get("invalidation"),
+            exit_trigger=t.get("exit_trigger"),
         )
         for t in payload.get("trades", [])
     ]
-    return trades, raw_text
+    reviews = [
+        PositionReview(
+            symbol=r["symbol"],
+            verdict=r.get("verdict", ""),
+            note=r.get("note", ""),
+            thesis=r.get("thesis"),
+            target=r.get("target"),
+            invalidation=r.get("invalidation"),
+        )
+        for r in payload.get("reviews", [])
+    ]
+    return trades, reviews, raw_text
 
 
-def get_claude_decision(prompt: str) -> tuple[list[ProposedTrade], str]:
+def get_claude_decision(
+    prompt: str,
+) -> tuple[list[ProposedTrade], list[PositionReview], str]:
     """Call the Anthropic API (/v1/messages) and parse the structured JSON
-    trade proposals from the response.
+    trade proposals and position reviews from the response.
 
-    Returns the parsed trades plus the raw response text (for logging).
+    Returns the parsed trades and reviews plus the raw response text (for logging).
     """
     import anthropic
 
@@ -265,6 +413,12 @@ def get_claude_decision(prompt: str) -> tuple[list[ProposedTrade], str]:
         messages=[{"role": "user", "content": prompt}],
     )
     raw_text = "".join(block.text for block in response.content if block.type == "text")
+    if response.stop_reason == "max_tokens":
+        # Truncated JSON would surface as an opaque decode error; say what it is.
+        raise RuntimeError(
+            f"Claude response hit the {config.CLAUDE_MAX_TOKENS}-token cap and was "
+            "truncated mid-JSON — raise config.CLAUDE_MAX_TOKENS. No trades placed."
+        )
     return _parse_trades_response(raw_text)
 
 
@@ -324,6 +478,17 @@ def validate_trades(
             continue
 
         if trade.side == "buy":
+            # A buy without a written case cannot be reviewed against later.
+            missing = [
+                f for f in ("thesis", "target", "invalidation")
+                if not (getattr(trade, f) or "").strip()
+            ]
+            if missing:
+                results.append(ValidatedTrade(
+                    trade, False, f"buy missing required thesis field(s): {', '.join(missing)}"
+                ))
+                continue
+
             projected_position_value = position_values.get(trade.symbol, 0.0) + trade.notional_usd
             if equity and projected_position_value / equity > config.MAX_POSITION_PCT:
                 results.append(ValidatedTrade(trade, False, "exceeds max position size (15%)"))
@@ -339,6 +504,14 @@ def validate_trades(
             results.append(ValidatedTrade(trade, True))
 
         else:  # sell
+            # A sell must name which trigger fired, so exits stay auditable.
+            if trade.exit_trigger not in config.VALID_EXIT_TRIGGERS:
+                results.append(ValidatedTrade(
+                    trade, False,
+                    f"sell has invalid or missing exit_trigger '{trade.exit_trigger}'",
+                ))
+                continue
+
             held_value = position_values.get(trade.symbol, 0.0)
             if held_value <= 0:
                 results.append(ValidatedTrade(trade, False, "no position held (long-only, no shorting)"))
@@ -433,8 +606,117 @@ def init_db(db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS theses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            thesis TEXT NOT NULL,
+            target TEXT NOT NULL,
+            invalidation TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            closed_at TEXT,
+            exit_trigger TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS position_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id INTEGER NOT NULL REFERENCES decision_cycles(id),
+            symbol TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            note TEXT
+        )
+        """
+    )
+    # One open thesis per symbol is an invariant the lifecycle below relies on.
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS theses_one_open_per_symbol
+        ON theses (symbol) WHERE status = 'open'
+        """
+    )
     conn.commit()
     return conn
+
+
+def fetch_open_theses(conn: sqlite3.Connection) -> dict[str, Thesis]:
+    """Load the standing investment case for every currently-held position."""
+    rows = conn.execute(
+        """
+        SELECT symbol, opened_at, thesis, target, invalidation, status, closed_at, exit_trigger
+        FROM theses WHERE status = 'open'
+        """
+    ).fetchall()
+    return {r[0]: Thesis(*r) for r in rows}
+
+
+def apply_thesis_lifecycle(
+    conn: sqlite3.Connection,
+    validated_trades: list[ValidatedTrade],
+    reviews: list[PositionReview],
+    portfolio: PortfolioState,
+    timestamp: datetime,
+) -> None:
+    """Open, carry, and close theses in response to executed trades and reviews.
+
+    A buy opens a thesis (or refreshes the existing one when adding to a winner).
+    A sell that closes out the whole position closes the thesis; a partial sell
+    leaves it open, since the case still stands on the remaining shares.
+
+    A review may also adopt an untracked position by supplying a full case —
+    that is how holdings opened before thesis tracking get one without having
+    to be sold and rebought.
+    """
+    now = timestamp.isoformat()
+    open_symbols = set(fetch_open_theses(conn))
+
+    for r in reviews:
+        if r.symbol in open_symbols or r.symbol not in portfolio.positions:
+            continue
+        if all((getattr(r, f) or "").strip() for f in ("thesis", "target", "invalidation")):
+            conn.execute(
+                """
+                INSERT INTO theses (symbol, opened_at, thesis, target, invalidation, status)
+                VALUES (?, ?, ?, ?, ?, 'open')
+                ON CONFLICT (symbol) WHERE status = 'open' DO NOTHING
+                """,
+                (r.symbol, now, r.thesis, r.target, r.invalidation),
+            )
+            open_symbols.add(r.symbol)
+
+    for v in validated_trades:
+        if not v.is_valid or v.order is None:
+            continue
+        trade = v.trade
+
+        if trade.side == "buy":
+            conn.execute(
+                """
+                INSERT INTO theses (symbol, opened_at, thesis, target, invalidation, status)
+                VALUES (?, ?, ?, ?, ?, 'open')
+                ON CONFLICT (symbol) WHERE status = 'open'
+                DO UPDATE SET thesis = excluded.thesis,
+                              target = excluded.target,
+                              invalidation = excluded.invalidation
+                """,
+                (trade.symbol, now, trade.thesis, trade.target, trade.invalidation),
+            )
+        else:
+            held_value = portfolio.positions[trade.symbol].market_value
+            # Treat a near-total sell as a full exit; market fills rarely land exact.
+            if trade.notional_usd >= held_value * 0.99:
+                conn.execute(
+                    """
+                    UPDATE theses SET status = 'closed', closed_at = ?, exit_trigger = ?
+                    WHERE symbol = ? AND status = 'open'
+                    """,
+                    (now, trade.exit_trigger, trade.symbol),
+                )
+    conn.commit()
 
 
 def log_decision_cycle(
@@ -442,6 +724,7 @@ def log_decision_cycle(
     prompt: str,
     claude_response: str,
     validated_trades: list[ValidatedTrade],
+    reviews: list[PositionReview],
     portfolio: PortfolioState,
     timestamp: datetime,
     mode: str,
@@ -478,6 +761,12 @@ def log_decision_cycle(
                 v.order["status"] if v.order else None,
             ),
         )
+
+    for r in reviews:
+        conn.execute(
+            "INSERT INTO position_reviews (cycle_id, symbol, verdict, note) VALUES (?, ?, ?, ?)",
+            (cycle_id, r.symbol, r.verdict, r.note),
+        )
     conn.commit()
 
 
@@ -489,18 +778,40 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
     """Run one full gather -> decide -> validate -> execute -> log cycle."""
     conn = init_db(db_path)
     try:
+        now = datetime.now(timezone.utc)
         portfolio = fetch_portfolio_state(mode)
         market = fetch_market_context(watchlist, portfolio)
-        prompt = build_decision_prompt(portfolio, market)
-        trades, raw_response = get_claude_decision(prompt)
+        theses = fetch_open_theses(conn)
+        prompt = build_decision_prompt(portfolio, market, theses, now)
+        trades, reviews, raw_response = get_claude_decision(prompt)
         validated = validate_trades(trades, portfolio)
         execute_trades(validated, mode)
+        apply_thesis_lifecycle(conn, validated, reviews, portfolio, now)
         log_decision_cycle(
-            conn, prompt, raw_response, validated, portfolio,
-            datetime.now(timezone.utc), mode,
+            conn, prompt, raw_response, validated, reviews, portfolio, now, mode,
         )
+        _print_cycle_summary(validated, reviews)
     finally:
         conn.close()
+
+
+def _print_cycle_summary(
+    validated: list[ValidatedTrade], reviews: list[PositionReview]
+) -> None:
+    """Human-readable cycle summary — this is what lands in the launchd log."""
+    for r in reviews:
+        print(f"  review  {r.symbol:<6} {r.verdict:<5} {r.note}")
+
+    executed = [v for v in validated if v.is_valid]
+    rejected = [v for v in validated if not v.is_valid]
+    if not executed:
+        print("  no trades this cycle")
+    for v in executed:
+        t = v.trade
+        tag = t.exit_trigger if t.side == "sell" else "new position"
+        print(f"  {t.side.upper():<4} {t.symbol:<6} ${t.notional_usd:,.2f}  [{tag}]")
+    for v in rejected:
+        print(f"  REJECTED {v.trade.side} {v.trade.symbol}: {v.rejection_reason}")
 
 
 def main() -> None:
