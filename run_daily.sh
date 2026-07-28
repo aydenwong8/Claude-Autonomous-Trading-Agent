@@ -8,7 +8,7 @@
 
 set -uo pipefail
 
-PROJECT_DIR="/Users/aydenwong/Downloads/Claude-Autonomous-Trading-Agent"
+PROJECT_DIR="/Users/aydenwong/Projects/Claude-Autonomous-Trading-Agent"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 LOG_DIR="$PROJECT_DIR/logs"
 MODE="paper"
