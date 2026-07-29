@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sqlite3
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -632,6 +633,20 @@ def init_db(db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    # Every invocation writes exactly one row here, success or failure, so a run
+    # that dies before logging a decision cycle still leaves a trace — silence
+    # from a scheduled run is otherwise indistinguishable from a no-trade day.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS run_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            error_text TEXT,
+            cycles_completed INTEGER NOT NULL
+        )
+        """
+    )
     # One open thesis per symbol is an invariant the lifecycle below relies on.
     conn.execute(
         """
@@ -719,6 +734,33 @@ def apply_thesis_lifecycle(
     conn.commit()
 
 
+def log_run(
+    conn: sqlite3.Connection,
+    outcome: str,
+    error_text: str | None,
+    cycles_completed: int,
+    timestamp: datetime | None = None,
+) -> None:
+    """Write one run_log row recording how this invocation ended.
+
+    Committed immediately: on the failure path this must be durable before the
+    process exits non-zero.
+    """
+    conn.execute(
+        """
+        INSERT INTO run_log (timestamp, outcome, error_text, cycles_completed)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            (timestamp or datetime.now(timezone.utc)).isoformat(),
+            outcome,
+            error_text,
+            cycles_completed,
+        ),
+    )
+    conn.commit()
+
+
 def log_decision_cycle(
     conn: sqlite3.Connection,
     prompt: str,
@@ -777,6 +819,7 @@ def log_decision_cycle(
 def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
     """Run one full gather -> decide -> validate -> execute -> log cycle."""
     conn = init_db(db_path)
+    cycles_completed = 0
     try:
         now = datetime.now(timezone.utc)
         portfolio = fetch_portfolio_state(mode)
@@ -790,7 +833,14 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         log_decision_cycle(
             conn, prompt, raw_response, validated, reviews, portfolio, now, mode,
         )
+        cycles_completed = 1
         _print_cycle_summary(validated, reviews)
+    except Exception:
+        # Record the failure before the exception propagates and exits non-zero.
+        log_run(conn, "failed", traceback.format_exc(), cycles_completed)
+        raise
+    else:
+        log_run(conn, "success", None, cycles_completed)
     finally:
         conn.close()
 

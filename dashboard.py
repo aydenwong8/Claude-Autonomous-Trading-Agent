@@ -13,10 +13,20 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import config
+
+# The market this agent trades runs on New York time; report timestamps there
+# rather than UTC so "after the close" reads as 4:00 PM.
+EASTERN = ZoneInfo("America/New_York")
+
+
+def _now_eastern() -> datetime:
+    return datetime.now(EASTERN)
 from agent import _data_client, _trading_client
 
 
@@ -34,6 +44,63 @@ def fetch_agent_equity_curve(mode: str) -> list[tuple[str, float]]:
             date = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
             points.append((date, float(equity)))
     return points
+
+
+def fetch_account_summary(mode: str, holdings: list[dict]) -> dict:
+    """Cash, equity, and today's P&L, with equity derived from `holdings`.
+
+    Equity is deliberately computed as (sum of position values + cash) using the
+    same position snapshot the holdings table renders, rather than read from
+    account.equity. The broker marks positions continuously, so an independent
+    account call lands a few seconds later at slightly different prices and the
+    headline number would disagree with the table it sits above.
+
+    Day P&L is that equity against the prior session's closing equity. Cash is
+    reported against the 5% minimum buffer the validation stage enforces, so a
+    position-sizing squeeze is visible on the dashboard.
+    """
+    account = _trading_client(mode).get_account()
+    cash = float(account.cash)
+    last_equity = float(account.last_equity)
+    equity = sum(h["value"] for h in holdings) + cash
+    return {
+        "cash": cash,
+        "equity": equity,
+        "cash_pct": (cash / equity * 100) if equity else 0.0,
+        "min_cash_buffer_pct": config.MIN_CASH_BUFFER_PCT * 100,
+        "day_pnl_usd": equity - last_equity,
+        "day_pnl_pct": (equity / last_equity - 1) * 100 if last_equity else 0.0,
+    }
+
+
+def fetch_holdings(mode: str) -> list[dict]:
+    """Current positions with per-holding day change and unrealised return.
+
+    Company names come from the broker asset record; a lookup failure falls
+    back to the ticker rather than dropping the row.
+    """
+    client = _trading_client(mode)
+    holdings = []
+    for p in client.get_all_positions():
+        try:
+            company = client.get_asset(p.symbol).name
+        except Exception:
+            company = p.symbol
+        holdings.append(
+            {
+                "company": company,
+                "symbol": p.symbol,
+                "price": float(p.current_price),
+                "qty": float(p.qty),
+                "value": float(p.market_value),
+                "day_change_usd": float(p.unrealized_intraday_pl),
+                "day_change_pct": float(p.unrealized_intraday_plpc) * 100,
+                "roi_usd": float(p.unrealized_pl),
+                "roi_pct": float(p.unrealized_plpc) * 100,
+            }
+        )
+    holdings.sort(key=lambda h: h["value"], reverse=True)
+    return holdings
 
 
 def fetch_spy_closes(start: str, end: str) -> list[tuple[str, float]]:
@@ -91,6 +158,76 @@ def fetch_decision_log(db_path: str) -> list[dict]:
     return log
 
 
+STALE_RUN_AFTER = timedelta(hours=24)
+
+
+def fetch_last_successful_run(db_path: str, now: datetime | None = None) -> dict | None:
+    """Newest successful run_log row, with whether it is older than 24h.
+
+    Returns None when the agent has never completed a run — or when the db
+    pre-dates run_log, which reads the same way from the dashboard's point of
+    view: no successful cycle we can point at.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT timestamp FROM run_log WHERE outcome = 'success' ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+    if not row:
+        return None
+
+    timestamp = row[0]
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return {"timestamp": timestamp, "stale": False}
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    age = (now or datetime.now(timezone.utc)) - parsed
+    return {
+        # Runs are logged in UTC; show them on market time like everything else.
+        "timestamp": parsed.astimezone(EASTERN).strftime("%Y-%m-%d %-I:%M %p ET"),
+        "stale": age > STALE_RUN_AFTER,
+    }
+
+
+TRADING_DAYS_PER_YEAR = 252
+# Below this, the standard deviation of a handful of days says nothing useful —
+# better to show "not yet" than a confident-looking number built on 3 returns.
+MIN_RETURNS_FOR_SHARPE = 5
+
+
+def compute_sharpe(
+    points: list[tuple[str, float]], risk_free_annual: float = 0.0
+) -> float | None:
+    """Annualised Sharpe ratio from a daily equity curve.
+
+    Returns None when there are too few daily returns to be meaningful, or when
+    the curve is perfectly flat (zero volatility — Sharpe undefined).
+    """
+    returns = [
+        curr / prev - 1
+        for (_, prev), (_, curr) in zip(points, points[1:])
+        if prev > 0
+    ]
+    if len(returns) < MIN_RETURNS_FOR_SHARPE:
+        return None
+
+    daily_rf = (1 + risk_free_annual) ** (1 / TRADING_DAYS_PER_YEAR) - 1
+    excess = [r - daily_rf for r in returns]
+    mean = sum(excess) / len(excess)
+    stdev = math.sqrt(sum((r - mean) ** 2 for r in excess) / (len(excess) - 1))
+    if stdev == 0:
+        return None
+    return mean / stdev * math.sqrt(TRADING_DAYS_PER_YEAR)
+
+
 def build_comparison(
     agent_points: list[tuple[str, float]], spy_points: list[tuple[str, float]]
 ) -> dict:
@@ -135,14 +272,30 @@ def build_comparison(
         "alpha_pp": agent_return_pct - spy_return_pct,
         "max_drawdown_pct": max_drawdown_pct,
         "current_equity": agent_points[-1][1],
+        "sharpe": compute_sharpe(agent_points),
+        "sharpe_min_days": MIN_RETURNS_FOR_SHARPE,
     }
 
 
-def render_dashboard(comparison: dict, decision_log: list[dict], mode: str) -> str:
+def render_dashboard(
+    comparison: dict,
+    decision_log: list[dict],
+    mode: str,
+    last_run: dict | None = None,
+    holdings: list[dict] | None = None,
+    account: dict | None = None,
+) -> str:
     data_json = json.dumps(
-        {"comparison": comparison, "decisions": decision_log, "mode": mode}
+        {
+            "comparison": comparison,
+            "decisions": decision_log,
+            "mode": mode,
+            "last_run": last_run,
+            "holdings": holdings or [],
+            "account": account,
+        }
     )
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    generated_at = _now_eastern().strftime("%Y-%m-%d %-I:%M %p ET")
     return DASHBOARD_TEMPLATE.replace("__DATA_JSON__", data_json).replace(
         "__GENERATED_AT__", html.escape(generated_at)
     )
@@ -289,6 +442,10 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
   th { color: var(--text-secondary); font-weight: 500; font-size: 0.75rem; }
   td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  th.num { text-align: right; }
+  td.num.good { color: var(--good); }
+  td.num.bad { color: var(--bad); }
+  td.ticker { font-weight: 600; }
   .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.72rem; }
   .pill.valid { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good); }
   .pill.rejected { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
@@ -296,14 +453,36 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
   .chart-wrap { position: relative; }
   .hidden { display: none; }
   .caveat { font-size: 0.76rem; color: var(--text-muted); margin-top: 10px; }
+
+  .last-run {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin-bottom: 16px;
+  }
+  .last-run.stale {
+    color: var(--bad);
+    border-color: color-mix(in srgb, var(--bad) 45%, transparent);
+    background: color-mix(in srgb, var(--bad) 10%, transparent);
+    font-weight: 600;
+  }
   footer { color: var(--text-muted); font-size: 0.75rem; margin-top: 8px; }
 </style>
 
 <div class="viz-root">
+  <div class="last-run" id="last-run"></div>
   <h1>Agent vs. SPY — Performance Dashboard</h1>
   <p class="subtitle" id="subtitle"></p>
 
   <div class="stat-row" id="stat-row"></div>
+
+  <div class="card">
+    <div class="card-title" style="margin-bottom: 12px;">Holdings</div>
+    <table id="holdings-table"></table>
+    <p class="caveat">Day change is per-position intraday P&amp;L from the broker. Its total can differ slightly from the account-level Day P&amp;L tile, which is measured against yesterday's closing equity and also reflects cash and any positions opened or closed today.</p>
+  </div>
 
   <div class="card">
     <div class="card-header">
@@ -340,15 +519,43 @@ function fmtUsd(v) {
 function fmtUsd0(v) {
   return "$" + Math.round(v).toLocaleString();
 }
+function fmtUsdSigned(v) {
+  return (v >= 0 ? "+" : "-") + fmtUsd(Math.abs(v));
+}
+function fmtQty(v) {
+  // Notional orders produce fractional share counts; whole shares stay clean.
+  return Number.isInteger(v) ? String(v) : v.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
 
-function renderStats(cmp) {
-  const tiles = [
+function renderStats(cmp, account) {
+  const tiles = [];
+
+  if (account) {
+    tiles.push({
+      label: "Day P&L",
+      value: fmtUsdSigned(account.day_pnl_usd) + " (" + fmtPct(account.day_pnl_pct) + ")",
+      cls: account.day_pnl_usd >= 0 ? "good" : "bad",
+    });
+    tiles.push({
+      label: "Cash (" + account.cash_pct.toFixed(1) + "% of equity)",
+      value: fmtUsd0(account.cash),
+      // Below the enforced buffer, new buys get rejected — flag it.
+      cls: account.cash_pct < account.min_cash_buffer_pct ? "bad" : "",
+    });
+  }
+
+  tiles.push(
     { label: "Agent total return", value: fmtPct(cmp.agent_return_pct), cls: cmp.agent_return_pct >= 0 ? "good" : "bad" },
     { label: "SPY buy & hold return", value: fmtPct(cmp.spy_return_pct), cls: cmp.spy_return_pct >= 0 ? "good" : "bad" },
     { label: "Alpha vs. SPY", value: fmtPct(cmp.alpha_pp) + " pp", cls: cmp.alpha_pp >= 0 ? "good" : "bad" },
+    cmp.sharpe === null || cmp.sharpe === undefined
+      ? { label: "Sharpe — needs " + cmp.sharpe_min_days + "+ trading days", value: "—", cls: "" }
+      : { label: "Sharpe (annualised)", value: cmp.sharpe.toFixed(2), cls: cmp.sharpe >= 0 ? "good" : "bad" },
     { label: "Agent max drawdown", value: fmtPct(cmp.max_drawdown_pct), cls: cmp.max_drawdown_pct < 0 ? "bad" : "good" },
-    { label: "Current equity", value: fmtUsd0(cmp.current_equity), cls: "" },
-  ];
+    // Live account equity, not the daily-history curve's last point — that point
+    // is the prior session's close and would disagree with the holdings table.
+    { label: "Current equity", value: fmtUsd0(account ? account.equity : cmp.current_equity), cls: "" },
+  );
   const row = document.getElementById("stat-row");
   tiles.forEach(t => {
     const el = document.createElement("div");
@@ -566,6 +773,108 @@ function renderTable(series) {
   });
 }
 
+function renderHoldings(holdings, account) {
+  const table = document.getElementById("holdings-table");
+  const thead = document.createElement("thead");
+  thead.innerHTML =
+    "<tr><th>Company</th><th>Ticker</th><th class='num'>Price</th><th class='num'>Shares</th>" +
+    "<th class='num'>Value</th><th class='num'>Day change</th><th class='num'>ROI $</th><th class='num'>ROI %</th></tr>";
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  if (holdings.length === 0 && !account) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 8;
+    td.className = "muted";
+    td.textContent = "No open positions.";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+
+  holdings.forEach(h => {
+    const tr = document.createElement("tr");
+    const cells = [
+      { v: h.company },
+      { v: h.symbol, cls: "ticker" },
+      { v: fmtUsd(h.price), num: true },
+      { v: fmtQty(h.qty), num: true },
+      { v: fmtUsd(h.value), num: true },
+      { v: fmtUsdSigned(h.day_change_usd) + " (" + fmtPct(h.day_change_pct) + ")", num: true, sign: h.day_change_usd },
+      { v: fmtUsdSigned(h.roi_usd), num: true, sign: h.roi_usd },
+      { v: fmtPct(h.roi_pct), num: true, sign: h.roi_pct },
+    ];
+    cells.forEach(c => {
+      const td = document.createElement("td");
+      let cls = c.num ? "num" : (c.cls || "");
+      if (c.sign !== undefined) cls += c.sign >= 0 ? " good" : " bad";
+      if (cls) td.className = cls;
+      td.textContent = c.v;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+
+  // Cash sits in the same table so the total reconciles to account equity.
+  if (account) {
+    const tr = document.createElement("tr");
+    [
+      { v: "Cash (uninvested)", cls: "muted" },
+      { v: "—", cls: "muted" },
+      { v: "—", num: true },
+      { v: "—", num: true },
+      { v: fmtUsd(account.cash), num: true },
+      { v: "—", num: true },
+      { v: "—", num: true },
+      { v: "—", num: true },
+    ].forEach(c => {
+      const td = document.createElement("td");
+      const cls = c.num ? "num" : (c.cls || "");
+      if (cls) td.className = cls;
+      td.textContent = c.v;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+
+  if (holdings.length === 0 && !account) return;
+
+  const total = holdings.reduce(
+    (a, h) => ({
+      value: a.value + h.value,
+      day: a.day + h.day_change_usd,
+      roi: a.roi + h.roi_usd,
+    }),
+    { value: 0, day: 0, roi: 0 }
+  );
+  if (account) total.value += account.cash;
+
+  const tfoot = document.createElement("tfoot");
+  const tr = document.createElement("tr");
+  const cells = [
+    { v: account ? "Total equity" : "Total" },
+    { v: "" },
+    { v: "" },
+    { v: "" },
+    { v: fmtUsd(total.value), num: true },
+    { v: fmtUsdSigned(total.day), num: true, sign: total.day },
+    { v: fmtUsdSigned(total.roi), num: true, sign: total.roi },
+    { v: "" },
+  ];
+  cells.forEach(c => {
+    const td = document.createElement("td");
+    let cls = c.num ? "num" : "";
+    if (c.sign !== undefined) cls += c.sign >= 0 ? " good" : " bad";
+    if (cls) td.className = cls;
+    td.style.fontWeight = "600";
+    td.textContent = c.v;
+    tr.appendChild(td);
+  });
+  tfoot.appendChild(tr);
+  table.appendChild(tfoot);
+}
+
 function renderDecisionLog(decisions, mode) {
   const table = document.getElementById("decision-table");
   const thead = document.createElement("thead");
@@ -627,7 +936,20 @@ function renderDecisionLog(decisions, mode) {
   table.appendChild(tbody);
 }
 
-renderStats(DATA.comparison);
+function renderLastRun(lastRun) {
+  const el = document.getElementById("last-run");
+  if (!lastRun) {
+    el.classList.add("stale");
+    el.textContent = "No successful cycle logged yet";
+    return;
+  }
+  el.classList.toggle("stale", !!lastRun.stale);
+  el.textContent = "Last successful cycle: " + lastRun.timestamp;
+}
+
+renderLastRun(DATA.last_run);
+renderStats(DATA.comparison, DATA.account);
+renderHoldings(DATA.holdings, DATA.account);
 renderLegend();
 renderChart(DATA.comparison.series);
 renderTable(DATA.comparison.series);
@@ -655,8 +977,13 @@ def main() -> None:
     spy_points = fetch_spy_closes(agent_points[0][0], agent_points[-1][0])
     comparison = build_comparison(agent_points, spy_points)
     decision_log = fetch_decision_log(args.db_path)
+    last_run = fetch_last_successful_run(args.db_path)
+    holdings = fetch_holdings(args.mode)
+    account = fetch_account_summary(args.mode, holdings)
 
-    html_out = render_dashboard(comparison, decision_log, args.mode)
+    html_out = render_dashboard(
+        comparison, decision_log, args.mode, last_run, holdings, account
+    )
     with open(args.out, "w") as f:
         f.write(html_out)
     print(f"Wrote {args.out}")
