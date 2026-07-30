@@ -17,14 +17,19 @@ import os
 import sqlite3
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from dotenv import load_dotenv
 
 import config
+import markettime
 
 load_dotenv()
+
+# Prompts are large and belong in files, not in the console or a `sqlite3`
+# one-liner's output. One plain-text file per cycle, named by cycle id.
+PROMPT_LOG_DIR = os.path.join("logs", "prompts")
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +176,7 @@ def fetch_portfolio_state(mode: str) -> PortfolioState:
         cash=float(account.cash),
         equity=float(account.equity),
         positions=positions,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=markettime.now_utc(),
     )
 
 
@@ -320,7 +325,9 @@ def build_decision_prompt(
         if t:
             opened = datetime.fromisoformat(t.opened_at)
             row["thesis"] = {
-                "opened_at": t.opened_at,
+                # Shown on market time — the model is reasoning about a
+                # session that opens and closes in New York.
+                "opened_at": markettime.fmt_et(t.opened_at),
                 "days_held": (as_of - opened).days,
                 "why_we_own_it": t.thesis,
                 "target": t.target,
@@ -336,7 +343,7 @@ def build_decision_prompt(
         positions_summary.append(row)
 
     state = {
-        "as_of": portfolio.timestamp.isoformat(),
+        "as_of": markettime.fmt_et(portfolio.timestamp),
         "cash": round(portfolio.cash, 2),
         "equity": round(portfolio.equity, 2),
         "positions": positions_summary,
@@ -752,7 +759,7 @@ def log_run(
         VALUES (?, ?, ?, ?)
         """,
         (
-            (timestamp or datetime.now(timezone.utc)).isoformat(),
+            (timestamp or markettime.now_utc()).isoformat(),
             outcome,
             error_text,
             cycles_completed,
@@ -770,9 +777,11 @@ def log_decision_cycle(
     portfolio: PortfolioState,
     timestamp: datetime,
     mode: str,
-) -> None:
+) -> int:
     """Persist the full prompt, Claude's response/reasoning, validation results,
     executed orders, and portfolio value for this cycle.
+
+    Returns the new cycle id, which names this cycle's prompt log file.
     """
     cursor = conn.execute(
         """
@@ -810,6 +819,38 @@ def log_decision_cycle(
             (cycle_id, r.symbol, r.verdict, r.note),
         )
     conn.commit()
+    return cycle_id
+
+
+def write_prompt_log(
+    cycle_id: int,
+    prompt: str,
+    mode: str,
+    timestamp: datetime,
+    log_dir: str = PROMPT_LOG_DIR,
+) -> str:
+    """Write this cycle's prompt to logs/prompts/{cycle_id}.txt and return the path.
+
+    Plain text, no ANSI — this is meant to be opened, diffed, and grepped long
+    after the run, where escape codes would be noise. The database still holds
+    the authoritative copy (README.md#architecture); this is the readable one.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, f"{cycle_id}.txt")
+    with open(path, "w") as f:
+        f.write(
+            f"cycle     {cycle_id}\n"
+            f"timestamp {markettime.fmt_et(timestamp)}\n"
+            f"mode      {mode}\n"
+            f"model     {config.CLAUDE_MODEL}\n"
+            "\n"
+            "=== SYSTEM PROMPT ===\n"
+            f"{SYSTEM_PROMPT}\n"
+            "\n"
+            "=== USER PROMPT ===\n"
+            f"{prompt}\n"
+        )
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -821,7 +862,7 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
     conn = init_db(db_path)
     cycles_completed = 0
     try:
-        now = datetime.now(timezone.utc)
+        now = markettime.now_utc()
         portfolio = fetch_portfolio_state(mode)
         market = fetch_market_context(watchlist, portfolio)
         theses = fetch_open_theses(conn)
@@ -830,11 +871,12 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         validated = validate_trades(trades, portfolio)
         execute_trades(validated, mode)
         apply_thesis_lifecycle(conn, validated, reviews, portfolio, now)
-        log_decision_cycle(
+        cycle_id = log_decision_cycle(
             conn, prompt, raw_response, validated, reviews, portfolio, now, mode,
         )
         cycles_completed = 1
-        _print_cycle_summary(validated, reviews)
+        prompt_path = write_prompt_log(cycle_id, prompt, mode, now)
+        _print_cycle_summary(cycle_id, now, validated, reviews, prompt_path)
     except Exception:
         # Record the failure before the exception propagates and exits non-zero.
         log_run(conn, "failed", traceback.format_exc(), cycles_completed)
@@ -846,22 +888,24 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
 
 
 def _print_cycle_summary(
-    validated: list[ValidatedTrade], reviews: list[PositionReview]
+    cycle_id: int,
+    timestamp: datetime,
+    validated: list[ValidatedTrade],
+    reviews: list[PositionReview],
+    prompt_path: str,
 ) -> None:
-    """Human-readable cycle summary — this is what lands in the launchd log."""
-    for r in reviews:
-        print(f"  review  {r.symbol:<6} {r.verdict:<5} {r.note}")
+    """Five-line cycle summary — this is what lands in the launchd log.
 
-    executed = [v for v in validated if v.is_valid]
-    rejected = [v for v in validated if not v.is_valid]
-    if not executed:
-        print("  no trades this cycle")
-    for v in executed:
-        t = v.trade
-        tag = t.exit_trigger if t.side == "sell" else "new position"
-        print(f"  {t.side.upper():<4} {t.symbol:<6} ${t.notional_usd:,.2f}  [{tag}]")
-    for v in rejected:
-        print(f"  REJECTED {v.trade.side} {v.trade.symbol}: {v.rejection_reason}")
+    A count, not a payload. The reasoning behind these numbers lives in the
+    database (`python report.py`) and the prompt file; a scheduled run's log
+    only needs to answer "did it run, and did anything happen".
+    """
+    rejected = sum(1 for v in validated if not v.is_valid)
+    print(f"cycle {cycle_id}  {markettime.fmt_et(timestamp)}")
+    print(f"  positions reviewed      {len(reviews)}")
+    print(f"  trades proposed         {len(validated)}")
+    print(f"  rejected by guardrails  {rejected}")
+    print(f"  prompt                  {prompt_path}")
 
 
 def main() -> None:

@@ -8,6 +8,10 @@
 
 set -uo pipefail
 
+# Every timestamp this project shows a human is market time; launchd's bare
+# environment has no TZ, so pin it rather than inherit whatever the host has.
+export TZ="America/New_York"
+
 PROJECT_DIR="/Users/aydenwong/Projects/Claude-Autonomous-Trading-Agent"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 LOG_DIR="$PROJECT_DIR/logs"

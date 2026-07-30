@@ -16,17 +16,9 @@ import json
 import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import config
-
-# The market this agent trades runs on New York time; report timestamps there
-# rather than UTC so "after the close" reads as 4:00 PM.
-EASTERN = ZoneInfo("America/New_York")
-
-
-def _now_eastern() -> datetime:
-    return datetime.now(EASTERN)
+import markettime
 from agent import _data_client, _trading_client
 
 
@@ -41,7 +33,9 @@ def fetch_agent_equity_curve(mode: str) -> list[tuple[str, float]]:
     points = []
     for ts, equity in zip(hist.timestamp, hist.equity):
         if equity and equity > 0:
-            date = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+            # Bucket on the market's calendar day, not UTC's — an evening
+            # snapshot is 20:00+ UTC and would otherwise land on tomorrow.
+            date = markettime.fmt_et_date(datetime.fromtimestamp(ts, tz=timezone.utc))
             points.append((date, float(equity)))
     return points
 
@@ -137,7 +131,7 @@ def fetch_decision_log(db_path: str) -> list[dict]:
         log.append(
             {
                 "id": cid,
-                "timestamp": ts,
+                "timestamp": markettime.fmt_et(ts),
                 "mode": mode,
                 "cash": cash,
                 "equity": equity,
@@ -182,17 +176,14 @@ def fetch_last_successful_run(db_path: str, now: datetime | None = None) -> dict
         return None
 
     timestamp = row[0]
-    try:
-        parsed = datetime.fromisoformat(timestamp)
-    except ValueError:
+    parsed = markettime.to_eastern(timestamp)
+    if parsed is None:
         return {"timestamp": timestamp, "stale": False}
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
 
-    age = (now or datetime.now(timezone.utc)) - parsed
+    age = (now or markettime.now_utc()) - parsed
     return {
         # Runs are logged in UTC; show them on market time like everything else.
-        "timestamp": parsed.astimezone(EASTERN).strftime("%Y-%m-%d %-I:%M %p ET"),
+        "timestamp": markettime.fmt_et(timestamp),
         "stale": age > STALE_RUN_AFTER,
     }
 
@@ -295,7 +286,7 @@ def render_dashboard(
             "account": account,
         }
     )
-    generated_at = _now_eastern().strftime("%Y-%m-%d %-I:%M %p ET")
+    generated_at = markettime.fmt_et(markettime.now_utc())
     return DASHBOARD_TEMPLATE.replace("__DATA_JSON__", data_json).replace(
         "__GENERATED_AT__", html.escape(generated_at)
     )
