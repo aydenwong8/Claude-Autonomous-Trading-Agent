@@ -1,3 +1,6 @@
 alpaca-py==0.43.5
 anthropic==0.116.0
 python-dotenv==1.2.2
+
+# Dev only — the scheduled run does not import it.
+pytest==9.1.1

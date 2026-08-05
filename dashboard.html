@@ -194,6 +194,13 @@
     <p class="caveat">Agent equity and SPY closes are paired by trading-day sequence, not raw date string — Alpaca's account-history day markers and market-data bar dates don't always land on identical UTC calendar days.</p>
   </div>
 
+  <div class="card" id="behavioral-card">
+    <div class="card-title" style="margin-bottom: 12px;">Behavioural metrics</div>
+    <div class="stat-row" id="behavioral-row"></div>
+    <table id="behavioral-table"></table>
+    <p class="caveat">These measure how the agent <em>behaves</em>, not how it performs — turnover, how often its own guardrails reject it, and whether its verdicts are stable. Rates that need more history than exists are shown as &mdash; rather than a number, since a ratio over a handful of decisions is noise. Reaction to volatility and news events is not measured here; it needs per-symbol price and news history joined to decision timestamps.</p>
+  </div>
+
   <div class="card">
     <div class="card-title" style="margin-bottom: 12px;">Decision cycle log</div>
     <table id="decision-table"></table>
@@ -203,8 +210,8 @@
 </div>
 
 <script>
-const DATA = {"comparison": {"series": [{"date": "2026-07-14", "agent_equity": 100000.0, "agent_index": 100.0, "spy_close": 751.94, "spy_index": 100.0}, {"date": "2026-07-15", "agent_equity": 100000.0, "agent_index": 100.0, "spy_close": 754.77, "spy_index": 100.37635981594275}, {"date": "2026-07-16", "agent_equity": 100305.84, "agent_index": 100.30584, "spy_close": 750.87, "spy_index": 99.85770141234673}, {"date": "2026-07-17", "agent_equity": 99713.6, "agent_index": 99.7136, "spy_close": 743.28, "spy_index": 98.84831236534829}, {"date": "2026-07-20", "agent_equity": 99674.7, "agent_index": 99.67469999999999, "spy_close": 742.15, "spy_index": 98.69803441763969}, {"date": "2026-07-21", "agent_equity": 99753.97, "agent_index": 99.75397000000001, "spy_close": 748.155, "spy_index": 99.49663536984332}, {"date": "2026-07-22", "agent_equity": 99464.62, "agent_index": 99.46462, "spy_close": 747.49, "spy_index": 99.40819746256349}, {"date": "2026-07-23", "agent_equity": 98860.03, "agent_index": 98.86003, "spy_close": 738.06, "spy_index": 98.15410804053514}, {"date": "2026-07-24", "agent_equity": 99505.58, "agent_index": 99.50558000000001, "spy_close": 738.9, "spy_index": 98.26581908130967}, {"date": "2026-07-27", "agent_equity": 100234.99, "agent_index": 100.23499, "spy_close": 738.85, "spy_index": 98.25916961459691}, {"date": "2026-07-28", "agent_equity": 100777.76, "agent_index": 100.77776, "spy_close": 740.795, "spy_index": 98.51783386972363}, {"date": "2026-07-29", "agent_equity": 100769.08, "agent_index": 100.76908, "spy_close": 729.57, "spy_index": 97.02502859270686}], "agent_return_pct": 0.7690799999999998, "spy_return_pct": -2.9749714072931366, "alpha_pp": 3.7440514072931363, "max_drawdown_pct": -1.4414016172936694, "current_equity": 100769.08, "sharpe": 2.443333611584186, "sharpe_min_days": 5}, "decisions": [{"id": 7, "timestamp": "2026-07-30 4:30 PM ET", "mode": "paper", "cash": 8000.08, "equity": 102229.2, "trades": [{"symbol": "MSFT", "side": "sell", "notional_usd": 700.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 6, "timestamp": "2026-07-29 4:30 PM ET", "mode": "paper", "cash": 12000.07, "equity": 100492.07, "trades": [{"symbol": "MSFT", "side": "buy", "notional_usd": 2000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "BRK.B", "side": "buy", "notional_usd": 2000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 5, "timestamp": "2026-07-28 5:53 PM ET", "mode": "paper", "cash": 17000.06, "equity": 100887.83, "trades": [{"symbol": "BRK.B", "side": "buy", "notional_usd": 5000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 4, "timestamp": "2026-07-27 1:45 AM ET", "mode": "paper", "cash": 41000.04, "equity": 99827.98, "trades": [{"symbol": "GOOGL", "side": "buy", "notional_usd": 9000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "JNJ", "side": "buy", "notional_usd": 8000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "XOM", "side": "buy", "notional_usd": 7000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 3, "timestamp": "2026-07-27 1:41 AM ET", "mode": "paper", "cash": 41000.04, "equity": 99819.19, "trades": []}, {"id": 2, "timestamp": "2026-07-27 1:39 AM ET", "mode": "paper", "cash": 41000.04, "equity": 99805.2, "trades": []}, {"id": 1, "timestamp": "2026-07-15 11:10 PM ET", "mode": "paper", "cash": 100000.0, "equity": 100000.0, "trades": [{"symbol": "SPY", "side": "buy", "notional_usd": 15000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "MSFT", "side": "buy", "notional_usd": 12000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "AAPL", "side": "buy", "notional_usd": 12000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "JPM", "side": "buy", "notional_usd": 10000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "V", "side": "buy", "notional_usd": 10000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}], "mode": "paper", "last_run": {"timestamp": "2026-07-30 4:30 PM ET", "stale": false}, "holdings": [{"company": "Microsoft Corporation Common Stock", "symbol": "MSFT", "price": 449.3551, "qty": 34.64846689, "value": 15569.465304, "day_change_usd": 2037.853045, "day_change_pct": 15.06, "roi_usd": 1569.485325, "roi_pct": 11.211}, {"company": "State Street SPDR S&P 500 ETF Trust", "symbol": "SPY", "price": 742.94, "qty": 19.909268279, "value": 14791.391775, "day_change_usd": 268.376936, "day_change_pct": 1.848, "roi_usd": -208.598224, "roi_pct": -1.391}, {"company": "Apple Inc. Common Stock", "symbol": "AAPL", "price": 325.73, "qty": 36.62934139, "value": 11931.275371, "day_change_usd": -456.401594, "day_change_pct": -3.6839999999999997, "roi_usd": -68.71463, "roi_pct": -0.573}, {"company": "VISA Inc.", "symbol": "V", "price": 366.45, "qty": 27.912661195, "value": 10228.594695, "day_change_usd": -63.640867, "day_change_pct": -0.618, "roi_usd": 228.604695, "roi_pct": 2.286}, {"company": "JPMorgan Chase & Co.", "symbol": "JPM", "price": 350.28, "qty": 28.802644085, "value": 10088.99017, "day_change_usd": 160.430727, "day_change_pct": 1.616, "roi_usd": 89.00017, "roi_pct": 0.89}, {"company": "Alphabet Inc. Class A Common Stock", "symbol": "GOOGL", "price": 335.18, "qty": 27.538663973, "value": 9230.40939, "day_change_usd": -42.134156, "day_change_pct": -0.45399999999999996, "roi_usd": 230.419388, "roi_pct": 2.56}, {"company": "Johnson & Johnson", "symbol": "JNJ", "price": 255.74, "qty": 30.551184996, "value": 7813.160051, "day_change_usd": -299.096101, "day_change_pct": -3.687, "roi_usd": -186.829936, "roi_pct": -2.335}, {"company": "ExxonMobil Holdings Corporation", "symbol": "XOM", "price": 157.01, "qty": 45.519508388, "value": 7147.018012, "day_change_usd": 11.835072, "day_change_pct": 0.166, "roi_usd": 147.028012, "roi_pct": 2.1}, {"company": "BERKSHIRE HATHAWAY Class B", "symbol": "BRK.B", "price": 509.65, "qty": 13.70200471, "value": 6983.2267, "day_change_usd": 6.713982, "day_change_pct": 0.096, "roi_usd": -16.753291, "roi_pct": -0.23900000000000002}], "account": {"cash": 8000.08, "equity": 101783.611468, "cash_pct": 7.859890098825158, "min_cash_buffer_pct": 5.0, "day_pnl_usd": 1014.5333255730075, "day_pnl_pct": 1.0067903212720442}};
-const GENERATED_AT = "2026-07-30 4:33 PM ET";
+const DATA = {"comparison": {"series": [{"date": "2026-07-14", "agent_equity": 100000.0, "agent_index": 100.0, "spy_close": 751.94, "spy_index": 100.0}, {"date": "2026-07-15", "agent_equity": 100000.0, "agent_index": 100.0, "spy_close": 754.77, "spy_index": 100.37635981594275}, {"date": "2026-07-16", "agent_equity": 100305.84, "agent_index": 100.30584, "spy_close": 750.87, "spy_index": 99.85770141234673}, {"date": "2026-07-17", "agent_equity": 99713.6, "agent_index": 99.7136, "spy_close": 743.28, "spy_index": 98.84831236534829}, {"date": "2026-07-20", "agent_equity": 99674.7, "agent_index": 99.67469999999999, "spy_close": 742.15, "spy_index": 98.69803441763969}, {"date": "2026-07-21", "agent_equity": 99753.97, "agent_index": 99.75397000000001, "spy_close": 748.155, "spy_index": 99.49663536984332}, {"date": "2026-07-22", "agent_equity": 99464.62, "agent_index": 99.46462, "spy_close": 747.49, "spy_index": 99.40819746256349}, {"date": "2026-07-23", "agent_equity": 98860.03, "agent_index": 98.86003, "spy_close": 738.06, "spy_index": 98.15410804053514}, {"date": "2026-07-24", "agent_equity": 99505.58, "agent_index": 99.50558000000001, "spy_close": 738.9, "spy_index": 98.26581908130967}, {"date": "2026-07-27", "agent_equity": 100234.99, "agent_index": 100.23499, "spy_close": 738.85, "spy_index": 98.25916961459691}, {"date": "2026-07-28", "agent_equity": 100777.76, "agent_index": 100.77776, "spy_close": 740.795, "spy_index": 98.51783386972363}, {"date": "2026-07-29", "agent_equity": 100769.08, "agent_index": 100.76908, "spy_close": 729.57, "spy_index": 97.02502859270686}, {"date": "2026-07-30", "agent_equity": 102071.79, "agent_index": 102.07179, "spy_close": 741.63, "spy_index": 98.6288799638269}, {"date": "2026-07-31", "agent_equity": 102342.94, "agent_index": 102.34294, "spy_close": 746.79, "spy_index": 99.31510492858472}, {"date": "2026-08-03", "agent_equity": 103586.74, "agent_index": 103.58674, "spy_close": 757.72, "spy_index": 100.76867835199617}, {"date": "2026-08-04", "agent_equity": 104470.98, "agent_index": 104.47098, "spy_close": 771.11, "spy_index": 102.54940553767587}], "agent_return_pct": 4.470979999999991, "spy_return_pct": 2.549405537675864, "alpha_pp": 1.921574462324127, "max_drawdown_pct": -1.4414016172936694, "current_equity": 104470.98, "sharpe": 7.947901332335109, "sharpe_min_days": 5}, "decisions": [{"id": 11, "timestamp": "2026-08-05 4:30 PM ET", "mode": "paper", "cash": 9200.0, "equity": 104055.67, "trades": [{"symbol": "MSFT", "side": "sell", "notional_usd": 1700.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "ETN", "side": "buy", "notional_usd": 1700.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 10, "timestamp": "2026-08-04 4:30 PM ET", "mode": "paper", "cash": 9200.02, "equity": 104554.85, "trades": []}, {"id": 9, "timestamp": "2026-08-03 4:41 PM ET", "mode": "paper", "cash": 11200.04, "equity": 103428.07, "trades": [{"symbol": "MSFT", "side": "sell", "notional_usd": 2000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "ETN", "side": "buy", "notional_usd": 4000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 8, "timestamp": "2026-07-31 4:30 PM ET", "mode": "paper", "cash": 8700.07, "equity": 102269.72, "trades": [{"symbol": "MSFT", "side": "sell", "notional_usd": 2500.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 7, "timestamp": "2026-07-30 4:30 PM ET", "mode": "paper", "cash": 8000.08, "equity": 102229.2, "trades": [{"symbol": "MSFT", "side": "sell", "notional_usd": 700.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 6, "timestamp": "2026-07-29 4:30 PM ET", "mode": "paper", "cash": 12000.07, "equity": 100492.07, "trades": [{"symbol": "MSFT", "side": "buy", "notional_usd": 2000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "BRK.B", "side": "buy", "notional_usd": 2000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 5, "timestamp": "2026-07-28 5:53 PM ET", "mode": "paper", "cash": 17000.06, "equity": 100887.83, "trades": [{"symbol": "BRK.B", "side": "buy", "notional_usd": 5000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 4, "timestamp": "2026-07-27 1:45 AM ET", "mode": "paper", "cash": 41000.04, "equity": 99827.98, "trades": [{"symbol": "GOOGL", "side": "buy", "notional_usd": 9000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "JNJ", "side": "buy", "notional_usd": 8000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "XOM", "side": "buy", "notional_usd": 7000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}, {"id": 3, "timestamp": "2026-07-27 1:41 AM ET", "mode": "paper", "cash": 41000.04, "equity": 99819.19, "trades": []}, {"id": 2, "timestamp": "2026-07-27 1:39 AM ET", "mode": "paper", "cash": 41000.04, "equity": 99805.2, "trades": []}, {"id": 1, "timestamp": "2026-07-15 11:10 PM ET", "mode": "paper", "cash": 100000.0, "equity": 100000.0, "trades": [{"symbol": "SPY", "side": "buy", "notional_usd": 15000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "MSFT", "side": "buy", "notional_usd": 12000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "AAPL", "side": "buy", "notional_usd": 12000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "JPM", "side": "buy", "notional_usd": 10000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}, {"symbol": "V", "side": "buy", "notional_usd": 10000.0, "is_valid": true, "rejection_reason": null, "order_status": "OrderStatus.ACCEPTED"}]}], "mode": "paper", "last_run": {"timestamp": "2026-08-05 4:30 PM ET", "stale": false}, "holdings": [{"company": "State Street SPDR S&P 500 ETF Trust", "symbol": "SPY", "price": 771.35, "qty": 19.909268279, "value": 15357.014087, "day_change_usd": 0.398185, "day_change_pct": 0.003, "roi_usd": 357.024088, "roi_pct": 2.3800000000000003}, {"company": "Microsoft Corporation Common Stock", "symbol": "MSFT", "price": 485.5581, "qty": 23.797770363, "value": 11555.200162, "day_change_usd": -172.579051, "day_change_pct": -1.472, "roi_usd": 1879.765272, "roi_pct": 19.428}, {"company": "Apple Inc. Common Stock", "symbol": "AAPL", "price": 312.75, "qty": 36.62934139, "value": 11455.82652, "day_change_usd": 123.440881, "day_change_pct": 1.089, "roi_usd": -544.163481, "roi_pct": -4.535}, {"company": "JPMorgan Chase & Co.", "symbol": "JPM", "price": 359.4, "qty": 28.802644085, "value": 10351.670284, "day_change_usd": 54.148971, "day_change_pct": 0.526, "roi_usd": 351.680284, "roi_pct": 3.517}, {"company": "VISA Inc.", "symbol": "V", "price": 368.54, "qty": 27.912661195, "value": 10286.932157, "day_change_usd": -29.308294, "day_change_pct": -0.28400000000000003, "roi_usd": 286.942157, "roi_pct": 2.869}, {"company": "Alphabet Inc. Class A Common Stock", "symbol": "GOOGL", "price": 364.39, "qty": 27.538663973, "value": 10034.813765, "day_change_usd": -365.162684, "day_change_pct": -3.511, "roi_usd": 1034.823763, "roi_pct": 11.498}, {"company": "Johnson & Johnson", "symbol": "JNJ", "price": 257.59, "qty": 30.551184996, "value": 7869.679743, "day_change_usd": 81.266152, "day_change_pct": 1.043, "roi_usd": -130.310244, "roi_pct": -1.629}, {"company": "BERKSHIRE HATHAWAY Class B", "symbol": "BRK.B", "price": 518.85, "qty": 13.70200471, "value": 7109.285144, "day_change_usd": 22.334268, "day_change_pct": 0.315, "roi_usd": 109.305139, "roi_pct": 1.562}, {"company": "ExxonMobil Holdings Corporation", "symbol": "XOM", "price": 151.63, "qty": 45.519508388, "value": 6902.123057, "day_change_usd": -106.060454, "day_change_pct": -1.513, "roi_usd": -97.866943, "roi_pct": -1.398}, {"company": "Eaton Corporation, plc Ordinary Shares", "symbol": "ETN", "price": 447.28, "qty": 8.896534653, "value": 3979.24202, "day_change_usd": 22.330302, "day_change_pct": 0.5640000000000001, "roi_usd": -20.747982, "roi_pct": -0.519}], "account": {"cash": 9200.0, "equity": 104101.786939, "cash_pct": 8.837504398835035, "min_cash_buffer_pct": 5.0, "day_pnl_usd": -369.19172436976805, "day_pnl_pct": -0.3533916587106889}, "behavioral": {"annualized_return_pct": null, "annualized_min_days": 63, "turnover": {"buy_usd": 97700.0, "sell_usd": 6900.0, "gross_traded_usd": 104600.0, "executed_trades": 17, "avg_portfolio_usd": 100720.78875, "period_days": 21, "first_date": "2026-07-14", "last_date": "2026-08-04", "turnover_pct": 6.850621490987876, "two_way_turnover_pct": 51.92572521429941, "annualized_turnover_pct": null, "annualized_min_days": 90, "definition": "min(purchases, sales) / average net assets"}, "rejection": {"total_proposed": 17, "accepted": 17, "rejected": 0, "rejected_pct": 0.0, "by_reason": []}, "consistency": {"reviews_total": 80, "symbols_reviewed": 10, "verdict_counts": {"hold": 76, "trim": 4}, "verdict_comparisons": 70, "verdict_flips": 3, "verdict_flip_pct": 4.285714285714286, "action_verdicts": 4, "unmatched_action_verdicts": 0, "unmatched_action_pct": 0.0, "closed_theses": 0, "mean_holding_days": null, "median_holding_days": null, "exit_triggers": []}}};
+const GENERATED_AT = "2026-08-05 7:01 PM ET";
 
 function fmtPct(v) {
   const s = (v >= 0 ? "+" : "") + v.toFixed(2) + "%";
@@ -572,6 +579,96 @@ function renderHoldings(holdings, account) {
   table.appendChild(tfoot);
 }
 
+// Unsigned percent — fmtPct prefixes "+" for gains, which reads oddly on a
+// turnover or rejection rate where there is no good or bad direction.
+function fmtRate(v, digits) {
+  return v === null || v === undefined ? "—" : v.toFixed(digits === undefined ? 1 : digits) + "%";
+}
+
+function renderBehavioral(b) {
+  const card = document.getElementById("behavioral-card");
+  if (!b) { card.remove(); return; }
+
+  const t = b.turnover, r = b.rejection, c = b.consistency;
+
+  const tiles = [
+    b.annualized_return_pct === null
+      ? { label: "Annualised return — needs " + b.annualized_min_days + "+ trading days", value: "—", cls: "" }
+      : { label: "Annualised return", value: fmtPct(b.annualized_return_pct),
+          cls: b.annualized_return_pct >= 0 ? "good" : "bad" },
+    { label: "Turnover (" + t.period_days + "d, " + t.definition + ")", value: fmtRate(t.turnover_pct), cls: "" },
+    { label: "Proposals rejected by guardrails",
+      value: r.total_proposed === 0 ? "—" : r.rejected + " / " + r.total_proposed + " (" + fmtRate(r.rejected_pct) + ")",
+      cls: r.rejected > 0 ? "bad" : "" },
+    { label: "Verdict flip rate", value: fmtRate(c.verdict_flip_pct),
+      cls: "" },
+  ];
+
+  const row = document.getElementById("behavioral-row");
+  tiles.forEach(x => {
+    const el = document.createElement("div");
+    el.className = "stat-tile";
+    const label = document.createElement("div");
+    label.className = "stat-label";
+    label.textContent = x.label;
+    const value = document.createElement("div");
+    value.className = "stat-value" + (x.cls ? " " + x.cls : "");
+    value.textContent = x.value;
+    el.appendChild(label); el.appendChild(value); row.appendChild(el);
+  });
+
+  const verdicts = Object.keys(c.verdict_counts).length
+    ? Object.entries(c.verdict_counts).map(([k, v]) => k + " " + v).join(", ")
+    : "none yet";
+  const reasons = r.by_reason.length
+    ? r.by_reason.map(x => (x.reason || "unspecified") + " (" + x.count + ")").join(", ")
+    : "none — no proposal has ever been rejected";
+  const triggers = c.exit_triggers.length
+    ? c.exit_triggers.map(x => x.trigger + " (" + x.count + ")").join(", ")
+    : "none — no thesis closed yet";
+  const holding = c.median_holding_days === null
+    ? "—  (no closed positions yet)"
+    : c.median_holding_days.toFixed(0) + "d median, " + c.mean_holding_days.toFixed(1) + "d mean";
+
+  const rows = [
+    ["Gross traded", fmtUsd0(t.gross_traded_usd) + " over " + t.executed_trades + " executed trades",
+     "Buys " + fmtUsd0(t.buy_usd) + ", sells " + fmtUsd0(t.sell_usd) + ", against average net assets of " + fmtUsd0(t.avg_portfolio_usd) + "."],
+    ["Two-way turnover", fmtRate(t.two_way_turnover_pct),
+     "(buys + sells) / 2 / average net assets — how busy it has been. Inflated early on because the opening balance had to be deployed."],
+    ["Annualised turnover",
+     t.annualized_turnover_pct === null ? "—" : fmtRate(t.annualized_turnover_pct),
+     t.annualized_turnover_pct === null
+       ? "Needs " + t.annualized_min_days + "+ calendar days; " + t.period_days + " so far."
+       : "Observed turnover scaled to a full year."],
+    ["Rejection reasons", reasons,
+     "A 0% rate means Claude's proposals have never violated a guardrail — not that the guardrails are inactive."],
+    ["Position reviews", c.reviews_total + " across " + c.symbols_reviewed + " symbols",
+     "Verdicts: " + verdicts + "."],
+    ["Verdict stability", c.verdict_flips + " flips in " + c.verdict_comparisons + " consecutive-review pairs",
+     "A flip is a verdict differing from that symbol's previous review. Compares the label only, so a 'hold' whose reasoning reversed still reads as stable."],
+    ["Says vs. does", c.unmatched_action_verdicts + " of " + c.action_verdicts + " trim/exit verdicts unmatched (" + fmtRate(c.unmatched_action_pct) + ")",
+     "A trim or exit verdict with no executed sell for that symbol in the same cycle — the agent contradicting itself within one response."],
+    ["Holding period", holding, "Across " + c.closed_theses + " closed theses. Exit triggers: " + triggers + "."],
+  ];
+
+  const table = document.getElementById("behavioral-table");
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>Metric</th><th>Value</th><th>Note</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  rows.forEach(([k, v, note]) => {
+    const tr = document.createElement("tr");
+    [k, v, note].forEach((cell, i) => {
+      const td = document.createElement("td");
+      td.textContent = cell;
+      if (i === 2) td.className = "muted";
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+}
+
 function renderDecisionLog(decisions, mode) {
   const table = document.getElementById("decision-table");
   const thead = document.createElement("thead");
@@ -650,6 +747,7 @@ renderHoldings(DATA.holdings, DATA.account);
 renderLegend();
 renderChart(DATA.comparison.series);
 renderTable(DATA.comparison.series);
+renderBehavioral(DATA.behavioral);
 renderDecisionLog(DATA.decisions, DATA.mode);
 
 document.getElementById("subtitle").textContent =

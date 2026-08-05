@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import traceback
@@ -56,9 +57,16 @@ class PortfolioState:
 
 @dataclass
 class MarketContext:
-    """Fresh prices and news for current holdings + watchlist, injected into the prompt."""
+    """Fresh prices and news for current holdings + watchlist, injected into the prompt.
+
+    `news` is per-held-symbol and complete: every open position gets its own
+    lookup, so an empty list means "no recent news", not "we didn't look".
+    `market_news` is a broad sample across the watchlist — it cannot be complete
+    at watchlist scale and must not be read as per-symbol coverage.
+    """
     prices: dict[str, float]
     news: dict[str, list[str]]
+    market_news: list[str]
     watchlist: list[str]
 
 
@@ -118,6 +126,10 @@ class ValidatedTrade:
     is_valid: bool
     rejection_reason: str | None = None
     order: dict[str, Any] | None = field(default=None)
+    # Set when submission raised. The trade passed validation and has an order
+    # record for the audit trail, but nothing reached the broker — so it must
+    # not move the thesis lifecycle.
+    submit_failed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +138,11 @@ class ValidatedTrade:
 
 def _trading_client(mode: str):
     from alpaca.trading.client import TradingClient
+
+    # Enforced here rather than only in main(): this is the single chokepoint
+    # every live order and account read must pass through, so no call path can
+    # reach a real account without clearing the lock.
+    config.assert_mode_allowed(mode)
 
     return TradingClient(
         api_key=os.environ["ALPACA_API_KEY"],
@@ -190,7 +207,7 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
 
     symbols = sorted(set(watchlist) | set(portfolio.positions.keys()))
     if not symbols:
-        return MarketContext(prices={}, news={}, watchlist=watchlist)
+        return MarketContext(prices={}, news={}, market_news=[], watchlist=watchlist)
 
     data_client = _data_client()
     latest_trades = data_client.get_stock_latest_trade(
@@ -199,18 +216,50 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
     prices = {symbol: float(trade.price) for symbol, trade in latest_trades.items()}
 
     news_client = _news_client()
-    news: dict[str, list[str]] = {symbol: [] for symbol in symbols}
-    news_set = news_client.get_news(
-        NewsRequest(symbols=",".join(symbols), limit=50)
-    )
-    for article in news_set.data.get("news", []) if hasattr(news_set, "data") else news_set:
-        headline = getattr(article, "headline", None)
-        article_symbols = getattr(article, "symbols", []) or []
-        for symbol in article_symbols:
-            if symbol in news and len(news[symbol]) < config.NEWS_HEADLINES_PER_SYMBOL and headline:
-                news[symbol].append(headline)
 
-    return MarketContext(prices=prices, news=news, watchlist=watchlist)
+    # One request per held symbol. A single shared request across the whole
+    # watchlist splits a fixed article cap over hundreds of names, so most
+    # holdings came back with nothing — measured at 7% symbol coverage on a
+    # 520-name watchlist, and it degrades as the universe grows. The agent has
+    # to review every open thesis against today's news, so that coverage cannot
+    # be left to chance; positions are few, so the extra calls are cheap.
+    news: dict[str, list[str]] = {}
+    for symbol in sorted(portfolio.positions):
+        news[symbol] = _headlines(
+            news_client, NewsRequest(symbols=symbol, limit=config.NEWS_HEADLINES_PER_SYMBOL)
+        )
+
+    # Broad sweep over the tradable universe for opportunities the agent doesn't
+    # already own. Deliberately not per-symbol: at watchlist scale that is not
+    # achievable in one cycle, so this is labelled a sample in the prompt.
+    market_news = _headlines(
+        news_client,
+        NewsRequest(symbols=",".join(watchlist), limit=config.MARKET_NEWS_ARTICLES),
+    )
+
+    return MarketContext(
+        prices=prices, news=news, market_news=market_news, watchlist=watchlist
+    )
+
+
+def _headlines(news_client, request) -> list[str]:
+    """Headlines for one news request, de-duplicated, newest first.
+
+    News is context, not a guardrail input — a failed lookup degrades the
+    prompt but must not abort a cycle that can still trade on prices.
+    """
+    try:
+        news_set = news_client.get_news(request)
+    except Exception:
+        return []
+
+    articles = news_set.data.get("news", []) if hasattr(news_set, "data") else news_set
+    seen: dict[str, None] = {}
+    for article in articles:
+        headline = getattr(article, "headline", None)
+        if headline:
+            seen.setdefault(headline, None)
+    return list(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +304,20 @@ today's price and news, and state whether it still holds.
 - "trim" — case intact but position should be smaller (pair with a partial sell)
 - "exit" — case is done or broken (pair with a sell for the full position value)
 A "trim" or "exit" verdict must have a matching sell in "trades", or it is ignored.
+
+WHAT THE NEWS FIELDS MEAN
+
+"position_news" is complete: every open position was looked up individually, so an \
+empty list there means no recent headlines were found for that holding — that is real \
+information, not a gap.
+
+"market_news_sample" is a small sample across a watchlist of hundreds of tickers. It \
+cannot cover them all. A ticker missing from it tells you nothing about that ticker, so \
+never infer from this field that a name has no news, and never treat its absence as a \
+reason to act or not act. Use it only as a prompt for what to look at.
+
+You are not being given full-market news coverage. Where a decision would turn on \
+information you were not given, say so in your reasoning rather than inferring it.
 
 Guardrails your proposals will be checked against:
 - Max position size: 15% of portfolio equity per ticker (post-trade)
@@ -348,7 +411,12 @@ def build_decision_prompt(
         "equity": round(portfolio.equity, 2),
         "positions": positions_summary,
         "watchlist_prices": {s: market.prices.get(s) for s in market.watchlist},
-        "recent_news": {s: h for s, h in market.news.items() if h},
+        # Kept separate on purpose. position_news is complete — every holding was
+        # looked up, so an empty list genuinely means no recent news and is
+        # itself information. market_news is a sample across the watchlist; a
+        # ticker's absence there says nothing about that ticker.
+        "position_news": {s: market.news.get(s, []) for s in portfolio.positions},
+        "market_news_sample": market.market_news,
     }
 
     return (
@@ -375,7 +443,14 @@ def _parse_trades_response(
             text = text[4:]
         text = text.strip()
 
-    payload = json.loads(text)
+    # json.loads accepts the bare literals NaN/Infinity by default. A NaN
+    # notional would pass every guardrail below — each one is a `<`/`>`
+    # comparison, and every comparison against NaN is False — so refuse the
+    # value at the door rather than relying on downstream checks to catch it.
+    def _reject_non_finite(literal: str) -> float:
+        raise ValueError(f"non-finite number in response: {literal}")
+
+    payload = json.loads(text, parse_constant=_reject_non_finite)
     trades = [
         ProposedTrade(
             symbol=t["symbol"],
@@ -435,7 +510,7 @@ def get_claude_decision(
 # ---------------------------------------------------------------------------
 
 def validate_trades(
-    trades: list[ProposedTrade], portfolio: PortfolioState
+    trades: list[ProposedTrade], portfolio: PortfolioState, mode: str
 ) -> list[ValidatedTrade]:
     """Check every proposed trade against the code-enforced guardrails.
 
@@ -466,16 +541,34 @@ def validate_trades(
             results.append(ValidatedTrade(trade, False, f"unrecognized side '{trade.side}'"))
             continue
 
-        if trade.symbol not in config.WATCHLIST:
+        # The whitelist bounds what we may *acquire*. Applying it to sells too
+        # would strand any holding whose ticker later leaves the list (renames,
+        # index changes — WATCHLIST is a hand-maintained snapshot), and with no
+        # human override that capital could never be recovered. Exiting a
+        # position is risk-reducing and stays permitted.
+        if trade.side == "buy" and trade.symbol not in config.WATCHLIST:
             results.append(ValidatedTrade(trade, False, "symbol not in whitelisted universe"))
             continue
 
-        if trade.notional_usd <= 0:
-            results.append(ValidatedTrade(trade, False, "notional must be positive"))
+        # isfinite rejects NaN and ±Infinity. NaN in particular would satisfy
+        # every guardrail below by making each comparison False.
+        if not math.isfinite(trade.notional_usd) or trade.notional_usd <= 0:
+            results.append(ValidatedTrade(trade, False, "notional must be a positive, finite number"))
+            continue
+
+        # Validate the amount that will actually be submitted — execute_trades
+        # rounds to cents, and a value under a cent would round to a $0 order.
+        if round(trade.notional_usd, 2) < config.MIN_TRADE_NOTIONAL_USD:
+            results.append(ValidatedTrade(
+                trade, False, f"notional below broker minimum (${config.MIN_TRADE_NOTIONAL_USD:.2f})"
+            ))
             continue
 
         if trading_client is None:
-            trading_client = _trading_client("paper")  # asset lookup is env-agnostic
+            # Must match the execution environment: paper and live keys are not
+            # valid against each other's endpoint, so a hardcoded "paper" here
+            # would 401 on every symbol in live mode and reject every trade.
+            trading_client = _trading_client(mode)
         try:
             asset = trading_client.get_asset(trade.symbol)
             if not asset.tradable:
@@ -497,8 +590,15 @@ def validate_trades(
                 ))
                 continue
 
+            # Fail closed on a non-positive equity snapshot (API glitch, or a
+            # mid-funding account): without a denominator the 15% cap cannot be
+            # evaluated, and skipping it would silently disable the guardrail.
+            if equity <= 0:
+                results.append(ValidatedTrade(trade, False, "cannot size position against non-positive equity"))
+                continue
+
             projected_position_value = position_values.get(trade.symbol, 0.0) + trade.notional_usd
-            if equity and projected_position_value / equity > config.MAX_POSITION_PCT:
+            if projected_position_value / equity > config.MAX_POSITION_PCT:
                 results.append(ValidatedTrade(trade, False, "exceeds max position size (15%)"))
                 continue
             if trade.notional_usd > running_cash:
@@ -527,7 +627,13 @@ def validate_trades(
             if trade.notional_usd > held_value:
                 results.append(ValidatedTrade(trade, False, "cannot sell more than held position"))
                 continue
-            running_cash += trade.notional_usd
+            # Deliberately does NOT credit running_cash. The sell has not been
+            # submitted yet, let alone filled or settled, so spending its
+            # proceeds on a buy later in the same cycle would place an order
+            # against money the account does not hold — which a margin account
+            # funds as leverage rather than rejecting. It also made the outcome
+            # depend on the order Claude happened to list the trades in.
+            # Proceeds become spendable next cycle, from the real balance.
             position_values[trade.symbol] = held_value - trade.notional_usd
             results.append(ValidatedTrade(trade, True))
 
@@ -547,6 +653,12 @@ def execute_trades(trades: list[ValidatedTrade], mode: str) -> list[dict[str, An
 
     Returns:
         Order confirmation records as returned by Alpaca.
+
+    A failure on one order must not abort the loop. Earlier orders in the list
+    are already live at the broker, and letting the exception propagate would
+    skip logging entirely — leaving real fills with no row in `trades`, no
+    thesis, and no decision_cycle. Each failure is recorded against its own
+    trade and the cycle proceeds to the logging stage.
     """
     from alpaca.trading.requests import MarketOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
@@ -558,20 +670,33 @@ def execute_trades(trades: list[ValidatedTrade], mode: str) -> list[dict[str, An
         if not validated.is_valid:
             continue
         trade = validated.trade
-        order_request = MarketOrderRequest(
-            symbol=trade.symbol,
-            notional=round(trade.notional_usd, 2),
-            side=OrderSide.BUY if trade.side == "buy" else OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-        )
-        order = client.submit_order(order_data=order_request)
-        order_record = {
+        order_record: dict[str, Any] = {
             "symbol": trade.symbol,
             "side": trade.side,
             "notional_usd": trade.notional_usd,
-            "order_id": str(order.id),
-            "status": str(order.status),
+            "order_id": None,
+            "status": None,
         }
+        try:
+            order_request = MarketOrderRequest(
+                symbol=trade.symbol,
+                notional=round(trade.notional_usd, 2),
+                side=OrderSide.BUY if trade.side == "buy" else OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+            order = client.submit_order(order_data=order_request)
+            order_record["order_id"] = str(order.id)
+            order_record["status"] = str(order.status)
+        except Exception as exc:
+            # Submission failed, so no fill exists for this trade — but the
+            # attempt still belongs in the log. A thesis must not be opened off
+            # an order that never reached the broker.
+            order_record["status"] = f"submit_failed: {type(exc).__name__}: {exc}"
+            validated.order = order_record
+            validated.submit_failed = True
+            orders.append(order_record)
+            continue
+
         validated.order = order_record
         orders.append(order_record)
 
@@ -711,7 +836,7 @@ def apply_thesis_lifecycle(
             open_symbols.add(r.symbol)
 
     for v in validated_trades:
-        if not v.is_valid or v.order is None:
+        if not v.is_valid or v.order is None or v.submit_failed:
             continue
         trade = v.trade
 
@@ -868,7 +993,7 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         theses = fetch_open_theses(conn)
         prompt = build_decision_prompt(portfolio, market, theses, now)
         trades, reviews, raw_response = get_claude_decision(prompt)
-        validated = validate_trades(trades, portfolio)
+        validated = validate_trades(trades, portfolio, mode)
         execute_trades(validated, mode)
         apply_thesis_lifecycle(conn, validated, reviews, portfolio, now)
         cycle_id = log_decision_cycle(
@@ -901,10 +1026,15 @@ def _print_cycle_summary(
     only needs to answer "did it run, and did anything happen".
     """
     rejected = sum(1 for v in validated if not v.is_valid)
+    failed = sum(1 for v in validated if v.submit_failed)
     print(f"cycle {cycle_id}  {markettime.fmt_et(timestamp)}")
     print(f"  positions reviewed      {len(reviews)}")
     print(f"  trades proposed         {len(validated)}")
     print(f"  rejected by guardrails  {rejected}")
+    # A validated trade the broker refused is not a no-op — surface it here or
+    # it is only visible by reading the trades table.
+    if failed:
+        print(f"  FAILED AT BROKER        {failed}")
     print(f"  prompt                  {prompt_path}")
 
 
@@ -922,6 +1052,10 @@ def main() -> None:
         help=f"Path to the SQLite log database (default: {config.DEFAULT_DB_PATH}).",
     )
     args = parser.parse_args()
+
+    # Fail before any broker or Claude call, so a mistaken `--mode live` costs
+    # nothing and prints the reason rather than a client error mid-cycle.
+    config.assert_mode_allowed(args.mode)
 
     run_decision_cycle(mode=args.mode, watchlist=config.WATCHLIST, db_path=args.db_path)
 

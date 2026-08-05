@@ -45,13 +45,46 @@ The agent is fully autonomous, but it operates inside hard constraints:
 | Rule | Value |
 |---|---|
 | Max position size | 15% of portfolio per ticker |
-| Universe | Long-only, whitelisted US equities/ETFs (e.g., S&P 1500) |
-| Leverage / margin / options | Not permitted |
+| Universe | Long-only, whitelisted US equities/ETFs — S&P 1500 ∪ Nasdaq-100 (1,519 symbols) |
+| Leverage / margin / options | Not permitted. Buys are funded only from cash already settled at the start of the cycle — proceeds from a sell in the same cycle are **not** spendable, since that sell has not filled yet and a margin account would fund the gap as leverage |
 | Minimum cash buffer | 5% |
 | Max trades per decision cycle | 5 |
-| Trade frequency | Weekly decision cycle (avoids PDT rules on accounts < $25k) |
-| Ticker validation | Every symbol verified against broker asset list before ordering |
- 
+| Minimum trade size | $1 notional (the broker's floor) |
+| Ticker validation | Every symbol verified against the broker asset list before ordering. The whitelist gates **buys** only — a held position whose ticker later leaves the index must always remain sellable |
+| Live-trading lock | `--mode live` refuses to run unless `TRADING_AGENT_ALLOW_LIVE` is set explicitly in the shell. Paper is the only thing reachable by accident |
+
+Enforcement lives in `validate_trades()` and is checked at the single broker-client
+chokepoint, so no call path can reach a live account or place an unvalidated order.
+Non-finite (`NaN`/`Infinity`) trade sizes are rejected at parse time — every guardrail
+is a numeric comparison, and comparisons against `NaN` are always false, so such a
+value would otherwise satisfy all of them.
+
+**Trade frequency.** The agent runs once daily after the close, not weekly as originally
+designed. Nothing in code enforces a trade-frequency limit; "most days should be zero
+trades" is instruction to the model, not a guardrail. On a paper account this is
+harmless, but PDT rules apply to live accounts under $25k — this needs a code-enforced
+limit before Phase 2, or it is the one advisory rule in an otherwise code-enforced set.
+
+## Thesis Lifecycle
+
+Every position carries a written investment case, which is what makes the agent
+auditable rather than merely active.
+
+- **Opening.** A buy is rejected unless it supplies three fields: the `thesis` (why we
+  own it), the `target` (what it playing out looks like), and the `invalidation` (what
+  would prove it wrong). A position without a written case cannot be reviewed later.
+- **Carrying.** Each stored thesis is replayed into every subsequent prompt alongside
+  that position's current price, unrealised P&L, and days held — so the agent argues
+  against its own prior reasoning instead of forming a fresh opinion daily.
+- **Reviewing.** Every cycle returns a verdict for *every* open position — `hold`,
+  `trim`, or `exit` — even on days with no trades. A `trim`/`exit` verdict with no
+  matching sell is recorded as the agent contradicting itself, and surfaces on the
+  dashboard as a "says vs. does" rate.
+- **Closing.** Every sell must name a valid exit trigger — `thesis_broken`,
+  `target_hit`, `bad_news`, `no_longer_fits`, or `risk`. This is enforced, not advisory:
+  a sell without one is rejected. Positions cannot be closed on price drift alone.
+
+
 ## Rollout Phases
  
 - **Phase 1 — Paper (4–8 weeks):** identical code, Alpaca paper-trading keys. Goal: shake out bugs, verify logging, watch behavior.
@@ -65,22 +98,36 @@ The agent is fully autonomous, but it operates inside hard constraints:
  
 ## Data Sources
  
-- **Alpaca** — positions, account state, order execution, basic market data
-- **yfinance / Alpha Vantage** — historical prices, supplemental data
-- **News API or web search tool** — recent headlines for holdings/watchlist (Claude's training data is stale for markets; all market context is injected fresh each cycle)
+**Alpaca is the only data source.** It covers positions, account state, order execution,
+prices, and news, so no second provider is needed. Claude's training data is stale for
+markets, so all of this is injected fresh every cycle and never recalled from the model.
+
+News coverage is split deliberately, because the two cases have different requirements:
+
+- **Position news** — one lookup per held position, so coverage is *complete*. An empty
+  list means no recent headlines were found for that holding, which is itself
+  information the agent can act on.
+- **Market news** — a 40-headline sample across the ~1,500-name watchlist. This cannot
+  be complete at that scale, and the prompt says so explicitly: a ticker's absence from
+  the sample tells the agent nothing about that ticker.
+
+That split matters. A single shared request across the whole watchlist gave **7% symbol
+coverage** (50 articles reaching 37 of 520 names), and most holdings were reviewed with
+no news at all — while the model had no way to tell "no news" from "not looked up".
+Per-position lookups take coverage of holdings to 100% for about 0.6s per cycle.
 
 ## Tech Stack
  
-- Python (Pandas / NumPy)
-- **Anthropic API (Claude)** — decision engine, structured JSON output
-- **Alpaca API** — brokerage: paper and live trading
-- SQLite — decision and performance logging
-- Cron / GitHub Actions — scheduling
+- Python — standard library only for analysis; no Pandas/NumPy dependency
+- **Anthropic API (Claude Opus 5)** — decision engine, structured JSON output
+- **Alpaca API** — brokerage, market data, and news
+- SQLite — decision, thesis, and performance logging
+- launchd (`run_daily.sh`) — weekdays at 16:30 ET, skipping market holidays
 ## API Costs
  
-- **Anthropic API:** pay-as-you-go per token (separate from any Claude.ai subscription). A weekly decision run costs cents; expected total well under $10/month. Prompt caching and the Batch API reduce costs further.
+- **Anthropic API:** pay-as-you-go per token, separate from any Claude.ai subscription. Measured, not estimated: a daily cycle over the 1,519-symbol universe is **~26,800 input tokens ≈ $0.20/run**, or **~$4/month** at 21 trading days (Claude Opus 5, $5/$25 per million tokens). Widening the universe from 520 to 1,519 symbols added only ~$1.30/month — prompt size scales at roughly 12.6 tokens per ticker, and the news sample is capped so it does not scale at all.
 - **Alpaca:** free (commission-free trading, free paper environment)
-- **Market data:** free tiers (yfinance, Alpha Vantage)
+- **Market data and news:** included with Alpaca at no additional cost
 
 ## Key Questions This Project Explores
  
@@ -110,7 +157,16 @@ git clone https://github.com/yourusername/claude-trading-agent.git
 cd claude-trading-agent
 pip install -r requirements.txt
 cp .env.example .env   # add ANTHROPIC_API_KEY + Alpaca keys (paper first!)
-python agent.py --mode paper
+python agent.py --mode paper       # one decision cycle
+python dashboard.py --mode paper   # regenerate dashboard.html
+python report.py                   # per-position thesis / verdict report
+```
+
+`--mode live` is locked and will refuse to run. Unlocking it is a deliberate, separate
+act, and is not something to put in `.env` where a scheduled run could pick it up:
+
+```bash
+TRADING_AGENT_ALLOW_LIVE=yes-trade-real-money python agent.py --mode live
 ```
  
 ## Disclaimer

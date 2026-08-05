@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 import config
 import markettime
+import metrics
 from agent import _data_client, _trading_client
 
 
@@ -268,6 +269,29 @@ def build_comparison(
     }
 
 
+def fetch_behavioral_metrics(db_path: str, agent_points: list[tuple[str, float]]) -> dict:
+    """The README's evaluation metrics that aren't derivable from the equity curve alone.
+
+    Annualised return is computed off the broker's daily curve (the same series
+    the chart uses); the behavioural measures come from the decision log.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return {
+            "annualized_return_pct": (
+                None
+                if (r := metrics.compute_annualized_return(agent_points)) is None
+                else r * 100
+            ),
+            "annualized_min_days": metrics.MIN_TRADING_DAYS_FOR_ANNUALIZING,
+            "turnover": metrics.compute_turnover(conn, agent_points),
+            "rejection": metrics.compute_rejection_stats(conn),
+            "consistency": metrics.compute_decision_consistency(conn),
+        }
+    finally:
+        conn.close()
+
+
 def render_dashboard(
     comparison: dict,
     decision_log: list[dict],
@@ -275,6 +299,7 @@ def render_dashboard(
     last_run: dict | None = None,
     holdings: list[dict] | None = None,
     account: dict | None = None,
+    behavioral: dict | None = None,
 ) -> str:
     data_json = json.dumps(
         {
@@ -284,6 +309,7 @@ def render_dashboard(
             "last_run": last_run,
             "holdings": holdings or [],
             "account": account,
+            "behavioral": behavioral,
         }
     )
     generated_at = markettime.fmt_et(markettime.now_utc())
@@ -486,6 +512,13 @@ DASHBOARD_TEMPLATE = r"""<!doctype html>
     <div class="chart-wrap" id="chart-wrap"></div>
     <table class="hidden" id="data-table"></table>
     <p class="caveat">Agent equity and SPY closes are paired by trading-day sequence, not raw date string — Alpaca's account-history day markers and market-data bar dates don't always land on identical UTC calendar days.</p>
+  </div>
+
+  <div class="card" id="behavioral-card">
+    <div class="card-title" style="margin-bottom: 12px;">Behavioural metrics</div>
+    <div class="stat-row" id="behavioral-row"></div>
+    <table id="behavioral-table"></table>
+    <p class="caveat">These measure how the agent <em>behaves</em>, not how it performs — turnover, how often its own guardrails reject it, and whether its verdicts are stable. Rates that need more history than exists are shown as &mdash; rather than a number, since a ratio over a handful of decisions is noise. Reaction to volatility and news events is not measured here; it needs per-symbol price and news history joined to decision timestamps.</p>
   </div>
 
   <div class="card">
@@ -866,6 +899,96 @@ function renderHoldings(holdings, account) {
   table.appendChild(tfoot);
 }
 
+// Unsigned percent — fmtPct prefixes "+" for gains, which reads oddly on a
+// turnover or rejection rate where there is no good or bad direction.
+function fmtRate(v, digits) {
+  return v === null || v === undefined ? "—" : v.toFixed(digits === undefined ? 1 : digits) + "%";
+}
+
+function renderBehavioral(b) {
+  const card = document.getElementById("behavioral-card");
+  if (!b) { card.remove(); return; }
+
+  const t = b.turnover, r = b.rejection, c = b.consistency;
+
+  const tiles = [
+    b.annualized_return_pct === null
+      ? { label: "Annualised return — needs " + b.annualized_min_days + "+ trading days", value: "—", cls: "" }
+      : { label: "Annualised return", value: fmtPct(b.annualized_return_pct),
+          cls: b.annualized_return_pct >= 0 ? "good" : "bad" },
+    { label: "Turnover (" + t.period_days + "d, " + t.definition + ")", value: fmtRate(t.turnover_pct), cls: "" },
+    { label: "Proposals rejected by guardrails",
+      value: r.total_proposed === 0 ? "—" : r.rejected + " / " + r.total_proposed + " (" + fmtRate(r.rejected_pct) + ")",
+      cls: r.rejected > 0 ? "bad" : "" },
+    { label: "Verdict flip rate", value: fmtRate(c.verdict_flip_pct),
+      cls: "" },
+  ];
+
+  const row = document.getElementById("behavioral-row");
+  tiles.forEach(x => {
+    const el = document.createElement("div");
+    el.className = "stat-tile";
+    const label = document.createElement("div");
+    label.className = "stat-label";
+    label.textContent = x.label;
+    const value = document.createElement("div");
+    value.className = "stat-value" + (x.cls ? " " + x.cls : "");
+    value.textContent = x.value;
+    el.appendChild(label); el.appendChild(value); row.appendChild(el);
+  });
+
+  const verdicts = Object.keys(c.verdict_counts).length
+    ? Object.entries(c.verdict_counts).map(([k, v]) => k + " " + v).join(", ")
+    : "none yet";
+  const reasons = r.by_reason.length
+    ? r.by_reason.map(x => (x.reason || "unspecified") + " (" + x.count + ")").join(", ")
+    : "none — no proposal has ever been rejected";
+  const triggers = c.exit_triggers.length
+    ? c.exit_triggers.map(x => x.trigger + " (" + x.count + ")").join(", ")
+    : "none — no thesis closed yet";
+  const holding = c.median_holding_days === null
+    ? "—  (no closed positions yet)"
+    : c.median_holding_days.toFixed(0) + "d median, " + c.mean_holding_days.toFixed(1) + "d mean";
+
+  const rows = [
+    ["Gross traded", fmtUsd0(t.gross_traded_usd) + " over " + t.executed_trades + " executed trades",
+     "Buys " + fmtUsd0(t.buy_usd) + ", sells " + fmtUsd0(t.sell_usd) + ", against average net assets of " + fmtUsd0(t.avg_portfolio_usd) + "."],
+    ["Two-way turnover", fmtRate(t.two_way_turnover_pct),
+     "(buys + sells) / 2 / average net assets — how busy it has been. Inflated early on because the opening balance had to be deployed."],
+    ["Annualised turnover",
+     t.annualized_turnover_pct === null ? "—" : fmtRate(t.annualized_turnover_pct),
+     t.annualized_turnover_pct === null
+       ? "Needs " + t.annualized_min_days + "+ calendar days; " + t.period_days + " so far."
+       : "Observed turnover scaled to a full year."],
+    ["Rejection reasons", reasons,
+     "A 0% rate means Claude's proposals have never violated a guardrail — not that the guardrails are inactive."],
+    ["Position reviews", c.reviews_total + " across " + c.symbols_reviewed + " symbols",
+     "Verdicts: " + verdicts + "."],
+    ["Verdict stability", c.verdict_flips + " flips in " + c.verdict_comparisons + " consecutive-review pairs",
+     "A flip is a verdict differing from that symbol's previous review. Compares the label only, so a 'hold' whose reasoning reversed still reads as stable."],
+    ["Says vs. does", c.unmatched_action_verdicts + " of " + c.action_verdicts + " trim/exit verdicts unmatched (" + fmtRate(c.unmatched_action_pct) + ")",
+     "A trim or exit verdict with no executed sell for that symbol in the same cycle — the agent contradicting itself within one response."],
+    ["Holding period", holding, "Across " + c.closed_theses + " closed theses. Exit triggers: " + triggers + "."],
+  ];
+
+  const table = document.getElementById("behavioral-table");
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>Metric</th><th>Value</th><th>Note</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  rows.forEach(([k, v, note]) => {
+    const tr = document.createElement("tr");
+    [k, v, note].forEach((cell, i) => {
+      const td = document.createElement("td");
+      td.textContent = cell;
+      if (i === 2) td.className = "muted";
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+}
+
 function renderDecisionLog(decisions, mode) {
   const table = document.getElementById("decision-table");
   const thead = document.createElement("thead");
@@ -944,6 +1067,7 @@ renderHoldings(DATA.holdings, DATA.account);
 renderLegend();
 renderChart(DATA.comparison.series);
 renderTable(DATA.comparison.series);
+renderBehavioral(DATA.behavioral);
 renderDecisionLog(DATA.decisions, DATA.mode);
 
 document.getElementById("subtitle").textContent =
@@ -960,6 +1084,7 @@ def main() -> None:
     parser.add_argument("--db-path", default=config.DEFAULT_DB_PATH)
     parser.add_argument("--out", default="dashboard.html")
     args = parser.parse_args()
+    config.assert_mode_allowed(args.mode)
 
     agent_points = fetch_agent_equity_curve(args.mode)
     if not agent_points:
@@ -971,9 +1096,10 @@ def main() -> None:
     last_run = fetch_last_successful_run(args.db_path)
     holdings = fetch_holdings(args.mode)
     account = fetch_account_summary(args.mode, holdings)
+    behavioral = fetch_behavioral_metrics(args.db_path, agent_points)
 
     html_out = render_dashboard(
-        comparison, decision_log, args.mode, last_run, holdings, account
+        comparison, decision_log, args.mode, last_run, holdings, account, behavioral
     )
     with open(args.out, "w") as f:
         f.write(html_out)
