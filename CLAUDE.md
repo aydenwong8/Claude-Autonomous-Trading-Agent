@@ -51,6 +51,16 @@ launchd gives a bare environment with `cwd=/`, which is why `run_daily.sh` uses
 absolute paths, `cd`s into the project (so `load_dotenv()` finds `./.env`), and
 exports `TZ` explicitly. Anything scheduled must keep those properties.
 
+If the Mac is asleep at 16:30, launchd fires the job on the next wake instead —
+and Wi-Fi is not up yet, so every host fails DNS and the cycle dies in seconds.
+That cost the 2026-08-06 cycle. `run_daily.sh` now waits up to 15 minutes for
+the broker/data/Anthropic hosts to accept TLS before doing anything, and writes
+a `failed` `run_log` row if they never do, so a stalled day is visible in the DB
+rather than looking like a no-trade day. **The cycle is never retried as a
+whole** — `execute_trades` runs before `log_decision_cycle`, so a rerun after a
+mid-cycle failure could place the same orders twice. Recovery belongs in
+pre-flight, not in a retry loop.
+
 ## Thesis lifecycle and exit triggers (not in README)
 
 This is the core behavioral design and has no README coverage.
