@@ -58,9 +58,15 @@ def assert_mode_allowed(mode: str) -> None:
 
 # --- Claude decision engine ---------------------------------------------------
 CLAUDE_MODEL = "claude-opus-5"
+# Thinking depth and overall token spend: low | medium | high | xhigh | max.
+# `high` is the API default; this cycle is a low-frequency, high-consequence
+# decision where reasoning quality matters far more than the per-call cost.
+CLAUDE_EFFORT = "xhigh"
 # Each cycle returns a full review per open position plus any trades, so this
 # scales with position count — 2048 truncated mid-JSON at only 5 positions.
-CLAUDE_MAX_TOKENS = 8192
+# Thinking tokens count against this too, so raising CLAUDE_EFFORT eats into
+# the same budget: at xhigh, 8192 is not enough headroom to be safe.
+CLAUDE_MAX_TOKENS = 32000
 
 # --- Tradable universe (long-only, whitelisted US equities/ETFs) -------------
 WATCHLIST = [

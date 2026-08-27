@@ -492,6 +492,9 @@ def get_claude_decision(
     response = client.messages.create(
         model=config.CLAUDE_MODEL,
         max_tokens=config.CLAUDE_MAX_TOKENS,
+        # Nested under output_config — `effort` is not a top-level parameter and
+        # is silently ignored if passed as one.
+        output_config={"effort": config.CLAUDE_EFFORT},
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -500,7 +503,9 @@ def get_claude_decision(
         # Truncated JSON would surface as an opaque decode error; say what it is.
         raise RuntimeError(
             f"Claude response hit the {config.CLAUDE_MAX_TOKENS}-token cap and was "
-            "truncated mid-JSON — raise config.CLAUDE_MAX_TOKENS. No trades placed."
+            "truncated mid-JSON — raise config.CLAUDE_MAX_TOKENS, or lower "
+            f"config.CLAUDE_EFFORT (currently {config.CLAUDE_EFFORT}; thinking "
+            "tokens count against the same cap). No trades placed."
         )
     return _parse_trades_response(raw_text)
 
@@ -968,6 +973,7 @@ def write_prompt_log(
             f"timestamp {markettime.fmt_et(timestamp)}\n"
             f"mode      {mode}\n"
             f"model     {config.CLAUDE_MODEL}\n"
+            f"effort    {config.CLAUDE_EFFORT}\n"
             "\n"
             "=== SYSTEM PROMPT ===\n"
             f"{SYSTEM_PROMPT}\n"
