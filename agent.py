@@ -489,7 +489,11 @@ def get_claude_decision(
     import anthropic
 
     client = anthropic.Anthropic()
-    response = client.messages.create(
+    # Streamed, not messages.create: the SDK refuses a non-streaming call whose
+    # max_tokens implies more than ten minutes of generation, and at
+    # CLAUDE_MAX_TOKENS=32000 it raises before sending anything. We still want
+    # the whole message at once, so collect the stream and take the final one.
+    with client.messages.stream(
         model=config.CLAUDE_MODEL,
         max_tokens=config.CLAUDE_MAX_TOKENS,
         # Nested under output_config — `effort` is not a top-level parameter and
@@ -497,7 +501,8 @@ def get_claude_decision(
         output_config={"effort": config.CLAUDE_EFFORT},
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
-    )
+    ) as stream:
+        response = stream.get_final_message()
     raw_text = "".join(block.text for block in response.content if block.type == "text")
     if response.stop_reason == "max_tokens":
         # Truncated JSON would surface as an opaque decode error; say what it is.
