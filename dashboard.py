@@ -23,14 +23,50 @@ import metrics
 from agent import _data_client, _trading_client
 
 
-def fetch_agent_equity_curve(mode: str) -> list[tuple[str, float]]:
-    """Daily (date, equity) points since account inception, weekend/zero days dropped."""
+def experiment_start(db_path: str) -> datetime | None:
+    """The first decision cycle's timestamp — when the agent began deciding.
+
+    This, not the account's funding date, is what the experiment is measured
+    from: equity before the first cycle is just cash sitting in an account.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        return None
+    try:
+        row = conn.execute("SELECT MIN(timestamp) FROM decision_cycles").fetchone()
+    finally:
+        conn.close()
+    return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+
+def fetch_agent_equity_curve(mode: str, db_path: str) -> list[tuple[str, float]]:
+    """Daily (date, equity) points since the first decision cycle, zero days dropped.
+
+    The window is anchored to the experiment's own start rather than a fixed
+    lookback. A rolling `period` silently redefines the headline number every
+    day it runs and eventually excludes the portfolio's construction entirely —
+    a 1-month window run on 2026-09-02 began on 2026-08-03, after every position
+    but one had already been opened, and reported +0.18% against a since-
+    inception +4.18%. Alpha vs. SPY is the whole point of the project; it has to
+    cover the whole experiment.
+    """
     from alpaca.trading.requests import GetPortfolioHistoryRequest
 
     client = _trading_client(mode)
-    hist = client.get_portfolio_history(
-        GetPortfolioHistoryRequest(period="1M", timeframe="1D")
+    start = experiment_start(db_path)
+    # `period` and `start` are mutually exclusive at the API, and `end` is not
+    # optional alongside `start`: given a start with no end, the endpoint
+    # applies its default one-month period and returns a window ending a month
+    # after the start — which for this account silently truncated the curve at
+    # 2026-08-14 and dropped the three most recent weeks. Falling back to a long
+    # period keeps the dashboard renderable against an empty database.
+    request = (
+        GetPortfolioHistoryRequest(start=start, end=markettime.now_utc(), timeframe="1D")
+        if start
+        else GetPortfolioHistoryRequest(period="1A", timeframe="1D")
     )
+    hist = client.get_portfolio_history(request)
     points = []
     for ts, equity in zip(hist.timestamp, hist.equity):
         if equity and equity > 0:
@@ -1086,7 +1122,7 @@ def main() -> None:
     args = parser.parse_args()
     config.assert_mode_allowed(args.mode)
 
-    agent_points = fetch_agent_equity_curve(args.mode)
+    agent_points = fetch_agent_equity_curve(args.mode, args.db_path)
     if not agent_points:
         raise SystemExit("No account equity history yet — fund the paper account and run a cycle first.")
 

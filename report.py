@@ -52,15 +52,34 @@ def fetch_positions(
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     rows = conn.execute(
         f"""SELECT symbol, opened_at, thesis, target, invalidation,
-                   status, closed_at, exit_trigger
+                   status, closed_at, exit_trigger, updated_at, revision
             FROM theses {clause}
             ORDER BY status = 'closed', opened_at DESC""",
         params,
     ).fetchall()
     keys = (
         "symbol", "opened_at", "thesis", "target", "invalidation",
-        "status", "closed_at", "exit_trigger",
+        "status", "closed_at", "exit_trigger", "updated_at", "revision",
     )
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def fetch_superseded_cases(conn: sqlite3.Connection, symbol: str) -> list[dict]:
+    """Earlier versions of a symbol's case, oldest first, current one excluded.
+
+    A case can be re-anchored while the position is still held, so the wording
+    in `theses` is only the latest draft. Without the earlier ones the record
+    would read as though the position had always been owned for today's reason.
+    """
+    rows = conn.execute(
+        """SELECT revision, revised_at, source, thesis, target, invalidation
+           FROM thesis_revisions
+           WHERE symbol = ? AND revision < (SELECT MAX(revision)
+                                            FROM thesis_revisions WHERE symbol = ?)
+           ORDER BY revision""",
+        (symbol, symbol),
+    ).fetchall()
+    keys = ("revision", "revised_at", "source", "thesis", "target", "invalidation")
     return [dict(zip(keys, r)) for r in rows]
 
 
@@ -113,6 +132,27 @@ def fetch_untracked(conn: sqlite3.Connection) -> list[str]:
     return [r[0] for r in rows]
 
 
+def fetch_unreviewed(conn: sqlite3.Connection) -> list[str]:
+    """Symbols with an open thesis that the latest cycle did not review.
+
+    The mirror of `fetch_untracked`, and the harder one to notice: a review
+    only ever happens for a held position, so a case whose position is gone
+    gets no verdict and simply stops appearing. It was invisible until the
+    agent started closing these out — a non-empty list here means the last
+    cycle carried a case for something the account did not own.
+    """
+    rows = conn.execute(
+        """SELECT t.symbol FROM theses t
+           WHERE t.status = 'open'
+             AND t.symbol NOT IN (
+                 SELECT symbol FROM position_reviews
+                 WHERE cycle_id = (SELECT MAX(id) FROM decision_cycles)
+             )
+           ORDER BY t.symbol"""
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def render_card(conn: sqlite3.Connection, position: dict, verdict_limit: int) -> str:
     """One position's full story: header, standing case, verdicts, trades."""
     symbol = position["symbol"]
@@ -130,9 +170,27 @@ def render_card(conn: sqlite3.Connection, position: dict, verdict_limit: int) ->
         )
 
     lines.append("")
+    revision = position.get("revision") or 1
+    if revision > 1:
+        lines.append(
+            f"  Case rev {revision} · re-anchored "
+            f"{markettime.fmt_et(position['updated_at'])}"
+        )
     lines.append(_wrap(position["thesis"], "Thesis"))
     lines.append(_wrap(position["target"], "Target"))
     lines.append(_wrap(position["invalidation"], "Invalidation"))
+
+    # The superseded wording is the part worth auditing: it is what the agent
+    # was actually holding itself to on every cycle before the rewrite.
+    for prior in fetch_superseded_cases(conn, symbol):
+        lines.append("")
+        lines.append(
+            f"  ── superseded rev {prior['revision']} "
+            f"({prior['source']}, until {markettime.fmt_et(prior['revised_at'])})"
+        )
+        lines.append(_wrap(prior["thesis"], "Thesis", indent=6))
+        lines.append(_wrap(prior["target"], "Target", indent=6))
+        lines.append(_wrap(prior["invalidation"], "Invalidation", indent=6))
 
     verdicts = fetch_verdicts(conn, symbol, verdict_limit)
     if verdicts:
@@ -200,9 +258,16 @@ def main() -> None:
         print("─" * WIDTH)
         print(f"{len(positions)} position(s) · as of {markettime.fmt_et(markettime.now_utc())}")
 
-        untracked = fetch_untracked(conn)
-        if untracked and not symbols:
-            print(f"Untracked (reviewed, no stored thesis): {', '.join(untracked)}")
+        if not symbols:
+            untracked = fetch_untracked(conn)
+            if untracked:
+                print(f"Untracked (reviewed, no stored thesis): {', '.join(untracked)}")
+            unreviewed = fetch_unreviewed(conn)
+            if unreviewed:
+                print(
+                    f"Unreviewed (open thesis, no position reviewed last cycle): "
+                    f"{', '.join(unreviewed)}"
+                )
     finally:
         conn.close()
 

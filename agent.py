@@ -17,7 +17,7 @@ import math
 import os
 import sqlite3
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
@@ -47,12 +47,49 @@ class Position:
 
 
 @dataclass
+class PendingOrder:
+    """An order accepted by the broker but not yet filled.
+
+    The agent decides after the close, so its orders queue until the next
+    session's open. Neither `cash` nor `positions` reflects them — the money
+    has not left and the shares have not arrived — so without this a cycle
+    that runs before the fill sees a portfolio that looks untouched and can
+    place the same order again.
+    """
+    symbol: str
+    side: str
+    notional_usd: float | None
+    qty: float | None
+    status: str
+    submitted_at: str | None
+
+
+@dataclass
 class PortfolioState:
     """Snapshot of account positions, cash, and P&L pulled from the broker."""
     cash: float
     equity: float
     positions: dict[str, Position]
     timestamp: datetime
+    # Orders already at the broker and not yet filled, keyed by symbol. A
+    # symbol can carry more than one.
+    pending_orders: dict[str, list[PendingOrder]] = field(default_factory=dict)
+    # Dollars that pending BUYS will consume from `cash` when they fill. Set
+    # once per cycle by `price_pending_orders` and read by both the prompt and
+    # validation, so the two can never disagree about what is spendable.
+    # Pending sells contribute nothing: their proceeds are unsettled, the same
+    # reason validation refuses to credit a sell within its own cycle.
+    pending_buy_commitment: float = 0.0
+    # Pending buys whose dollar value could not be established. Their cost is
+    # NOT in the commitment above, so it understates what is spoken for.
+    unpriced_pending_buys: list[str] = field(default_factory=list)
+    # Dollars of each position already being sold by an unfilled order. That
+    # much of the holding is spoken for and cannot be sold a second time.
+    pending_sell_value: dict[str, float] = field(default_factory=dict)
+    # Symbols with an unfilled sell of unknowable size. How much of the holding
+    # remains disposable cannot be computed, so further sells are refused
+    # outright rather than guessed at.
+    unvaluable_pending_sells: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -86,6 +123,12 @@ class Thesis:
     status: str = "open"  # "open" | "closed"
     closed_at: str | None = None
     exit_trigger: str | None = None
+    # A case is allowed to be re-anchored while the position is still held —
+    # a target that has been passed stops being a decision criterion and starts
+    # being noise. `revision` is 1 at open and increments on every rewrite;
+    # every version is kept in `thesis_revisions`.
+    updated_at: str | None = None
+    revision: int = 1
 
 
 @dataclass
@@ -98,8 +141,10 @@ class PositionReview:
     symbol: str
     verdict: str  # "hold" | "trim" | "exit"
     note: str
-    # Set when adopting a position that has no stored thesis yet (opened before
-    # thesis tracking, or outside the agent). Persisted as a new open thesis.
+    # Two uses, both persisted to `theses`: adopting a position that has no
+    # stored case yet (opened before thesis tracking, or outside the agent),
+    # and re-anchoring the case on a position that already has one. All three
+    # must be supplied together — a case patched field-by-field is incoherent.
     thesis: str | None = None
     target: str | None = None
     invalidation: str | None = None
@@ -173,6 +218,91 @@ def _news_client():
 # Stage 1: Gather state
 # ---------------------------------------------------------------------------
 
+def fetch_pending_orders(client) -> dict[str, list[PendingOrder]]:
+    """Open (unfilled) orders at the broker, grouped by symbol.
+
+    A failure here must not take the cycle down: the account state is still
+    usable without it, and an empty result is the same shape as "nothing
+    pending". It does mean the prompt loses its in-flight warning, so the
+    exception is surfaced rather than swallowed silently.
+    """
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+
+    pending: dict[str, list[PendingOrder]] = {}
+    try:
+        orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    except Exception as exc:
+        print(f"  warning: could not read open orders ({type(exc).__name__}: {exc})")
+        return pending
+
+    for o in orders:
+        pending.setdefault(o.symbol, []).append(
+            PendingOrder(
+                symbol=o.symbol,
+                side=str(o.side).split(".")[-1].lower(),
+                notional_usd=float(o.notional) if o.notional is not None else None,
+                qty=float(o.qty) if o.qty is not None else None,
+                status=str(o.status).split(".")[-1].lower(),
+                submitted_at=o.submitted_at.isoformat() if o.submitted_at else None,
+            )
+        )
+    return pending
+
+
+def price_pending_orders(portfolio: PortfolioState, prices: dict[str, float]) -> None:
+    """Value the unfilled orders against `prices` and record them on `portfolio`.
+
+    Both sides of the book are double-countable while an order sits unfilled,
+    because neither `cash` nor `positions` has moved yet:
+
+    - A pending **buy** means cash alone overstates what can be spent, by
+      exactly the size of the order. Spending it twice is how an account
+      breaches its own cash buffer with no single decision looking wrong: cycle
+      29 left a $2,900 buy in flight, and cycle 30 was shown $3,093 of
+      "deployable" cash when barely $190 was genuinely free.
+    - A pending **sell** means the position overstates what can still be sold.
+      Selling the same shares twice would take a long-only account short.
+
+    Needs prices because an order placed outside the agent may be sized in
+    shares rather than dollars. The two unvaluable cases are handled
+    differently, because caution points opposite ways: an unvaluable buy is
+    merely named (the commitment becomes a floor, and the prompt says so),
+    while an unvaluable sell blocks further sells of that symbol outright —
+    there is no safe way to guess how much of a holding is still disposable.
+    """
+    def value_of(o: PendingOrder) -> float | None:
+        if o.notional_usd is not None:
+            return o.notional_usd
+        if o.qty is not None and prices.get(o.symbol):
+            return o.qty * prices[o.symbol]
+        return None
+
+    committed = 0.0
+    unpriced: list[str] = []
+    sell_value: dict[str, float] = {}
+    unvaluable_sells: list[str] = []
+
+    for symbol, orders in portfolio.pending_orders.items():
+        for o in orders:
+            value = value_of(o)
+            if o.side == "buy":
+                if value is None:
+                    unpriced.append(symbol)
+                else:
+                    committed += value
+            else:
+                if value is None:
+                    unvaluable_sells.append(symbol)
+                else:
+                    sell_value[symbol] = sell_value.get(symbol, 0.0) + value
+
+    portfolio.pending_buy_commitment = committed
+    portfolio.unpriced_pending_buys = unpriced
+    portfolio.pending_sell_value = sell_value
+    portfolio.unvaluable_pending_sells = unvaluable_sells
+
+
 def fetch_portfolio_state(mode: str) -> PortfolioState:
     """Pull current positions, cash, and P&L from the Alpaca API."""
     client = _trading_client(mode)
@@ -194,6 +324,7 @@ def fetch_portfolio_state(mode: str) -> PortfolioState:
         equity=float(account.equity),
         positions=positions,
         timestamp=markettime.now_utc(),
+        pending_orders=fetch_pending_orders(client),
     )
 
 
@@ -295,6 +426,18 @@ Do not sell because a position is merely down, and do not hold because it is mer
 up. Price alone is not a thesis. Judge the case, not the P&L. Equally, do not let a \
 broken thesis sit just because you are not yet at a loss.
 
+You are benchmarked against SPY. Buying SPY is permitted and is sometimes the honest \
+answer, but it is a decision you have to make on purpose, not a default place to park \
+capital: index beta cannot generate alpha against the index, so a position in SPY \
+should be justified as deliberately-chosen beta with its own case, and reviewed on \
+those terms like anything else.
+
+The 15% per-ticker cap is not a diversification guarantee. Five names moving on one \
+driver — the same AI-capex cycle, the same rate path, the same consumer — is one \
+position wearing five tickers, and nothing in code will stop you building it. Name \
+the shared drivers across the book in your commentary, and treat concentration in a \
+theme as real risk even when every individual weight is inside the cap.
+
 DAILY REVIEW
 
 You must return a review verdict for EVERY open position, every cycle, even when you \
@@ -304,6 +447,30 @@ today's price and news, and state whether it still holds.
 - "trim" — case intact but position should be smaller (pair with a partial sell)
 - "exit" — case is done or broken (pair with a sell for the full position value)
 A "trim" or "exit" verdict must have a matching sell in "trades", or it is ignored.
+
+RE-ANCHORING A CASE
+
+A case you wrote weeks ago can go stale without being wrong. The commonest way: the \
+price marker in "target" is passed while the operating condition it was standing in \
+for is still intact. A passed marker is not a decision criterion any more, and \
+trimming against it every cycle is not discipline — it is being driven by a number \
+that has expired.
+
+When that happens, rewrite the case. Return the review for that position with \
+"thesis", "target" and "invalidation" alongside "note", and the new wording replaces \
+the stored case from the next cycle onward. All three are required together: a \
+partial rewrite is discarded, and you will be told it was discarded rather than left \
+to believe it took. Every version is kept and dated, so a rewrite is an amendment on \
+the record, not an edit to history — "case_revision" and "last_reanchored_at" on each \
+position show you how often you have already done this.
+
+Re-anchoring is for when a marker has expired or the facts have moved, and you should \
+say in the note what specifically changed. It is not for routine housekeeping. \
+Ratcheting a price target upward every time the price rises is moving the goalposts, \
+not managing a position: if you find yourself raising a target for the third time \
+with no new operating information, the honest conclusion is that you never had a \
+price view worth writing down — anchor the case to the business condition you \
+actually own instead.
 
 WHAT THE NEWS FIELDS MEAN
 
@@ -326,10 +493,67 @@ Guardrails your proposals will be checked against:
 - Minimum cash buffer: 5% of equity must remain uninvested
 - At most 5 trades per decision cycle
 
+HOW CAPITAL ACTUALLY MOVES
+
+Three cash figures are given, already computed. Do not re-derive them, and do not \
+propose buys against gross cash — a buy that would breach the buffer is rejected \
+outright, not trimmed to fit.
+- "deployable_cash" — cash above the 5% buffer, before orders already placed
+- "committed_to_pending_buys" — what unfilled buys will take out of that on fill
+- "uncommitted_cash" — the difference, and **the figure to size new buys against**
+
+Only the third is really yours to spend. The other two are shown so you can see that \
+capital is committed rather than merely gone. Validation uses the same arithmetic, so \
+a buy sized against "deployable_cash" while an order is in flight is rejected, not \
+accepted-and-regretted. If "pending_buys_of_unknown_value" appears, some pending buy \
+could not be valued and "uncommitted_cash" is an over-estimate — treat it as a ceiling.
+
+Sell proceeds are NOT spendable in the same cycle. A sell you propose now has not been \
+submitted, filled or settled, so validation does not credit it, and a buy later in the \
+same response is checked against the cash you hold today. This is deliberate: spending \
+unsettled proceeds is leverage, and it would make the outcome depend on the order you \
+happened to list the trades in.
+
+The consequence is that **rotation is a two-cycle operation, and that is a supported \
+move, not a failure**. Sell today with the exit trigger that fired; the proceeds are in \
+"uncommitted_cash" tomorrow, and you buy then. If the reason you are not acting on a \
+better idea is that the capital is currently inside a worse one, the answer is to start \
+the rotation, not to record another day of having no room. Say in your commentary when \
+you are doing this, so the next cycle knows the cash is earmarked.
+
+Being fully invested is not itself a virtue. If every position is worth its weight, \
+holding is right. But "no cash to act" is a position you chose, and it is reviewable \
+like any other.
+
+ORDERS ALREADY IN FLIGHT
+
+"orders_in_flight" lists orders the broker has accepted but not yet filled. You place \
+orders after the close, so they queue until the next session opens. Until they fill, \
+neither "cash" nor "positions" reflects them: the money has not left and the shares \
+have not arrived.
+
+Read the book as those orders having already happened. A pending buy means you own \
+that name; a pending sell means that position is already on its way out and its \
+proceeds are already spoken for. Do not re-propose a trade that is sitting in this \
+list — you would be doubling it, not placing it. This list is normally empty, because \
+a cycle usually runs after the previous cycle's orders have filled; when it is not \
+empty, something ran twice or a fill did not happen.
+
+"cases_not_yet_held" lists written cases whose position is not in the book. Each says \
+whether an in-flight order explains it:
+- "explained_by_pending_order": true — the buy simply has not filled yet. Nothing to \
+  do. Do not buy it again.
+- "explained_by_pending_order": false — you hold a written case for something the \
+  account does not own. The order never filled, or the position left outside your \
+  control. These get no position review, so say what you want done with the case in \
+  your commentary; code closes it out this cycle either way.
+
 Respond with ONLY a single JSON object (no prose, no markdown fences) matching this shape:
 {
   "reviews": [
-    {"symbol": "AAPL", "verdict": "hold", "note": "why the stored thesis still holds, or why it doesn't"}
+    {"symbol": "AAPL", "verdict": "hold", "note": "why the stored thesis still holds, or why it doesn't"},
+    {"symbol": "MSFT", "verdict": "hold", "note": "what changed, and why the case is being rewritten",
+     "thesis": "...", "target": "...", "invalidation": "..."}
   ],
   "trades": [
     {"symbol": "NVDA", "side": "buy", "notional_usd": 1000.0, "reasoning": "...",
@@ -352,7 +576,7 @@ or outside the agent. Do not leave it untracked: either exit it, or adopt it by 
 returning its review with "verdict": "hold" plus "thesis", "target", and \
 "invalidation" fields alongside "note". Those are stored and shown back to you from \
 the next cycle onward. Writing the case only in "note" does NOT store it, and you \
-will be asked again tomorrow."""
+will be asked again tomorrow — the same is true of a re-anchored case."""
 
 
 def build_decision_prompt(
@@ -396,6 +620,13 @@ def build_decision_prompt(
                 "target": t.target,
                 "invalidation": t.invalidation,
             }
+            # Surfaced so re-anchoring stays visible to the model that does it:
+            # a case on its fourth revision is either tracking real change or
+            # chasing the price, and it can only tell which if it can see the
+            # count. Omitted entirely while the case is still the original.
+            if t.revision > 1:
+                row["thesis"]["case_revision"] = t.revision
+                row["thesis"]["last_reanchored_at"] = markettime.fmt_et(t.updated_at)
         else:
             # Pre-dates thesis tracking, or was opened outside the agent.
             row["thesis"] = None
@@ -405,10 +636,68 @@ def build_decision_prompt(
             )
         positions_summary.append(row)
 
+    # Computed here rather than left to the model. It had been re-deriving
+    # "cash minus the 5% buffer" from scratch in every cycle's commentary, which
+    # is arithmetic the code already does authoritatively in validate_trades —
+    # and a buy sized against gross cash is rejected outright, not trimmed.
+    min_cash_required = config.MIN_CASH_BUFFER_PCT * portfolio.equity
+    deployable_cash = max(0.0, portfolio.cash - min_cash_required)
+    # Shown as three numbers rather than one netted figure: the model should be
+    # able to see that capital is committed, not just that it is gone.
+    uncommitted_cash = max(0.0, deployable_cash - portfolio.pending_buy_commitment)
+
+    # An accepted order changes neither cash nor positions until it fills, so
+    # without this the state looks identical to the state that produced the
+    # order and the same trade gets proposed again.
+    orders_in_flight = [
+        {
+            "symbol": o.symbol,
+            "side": o.side,
+            "notional_usd": o.notional_usd,
+            "qty": o.qty,
+            "status": o.status,
+            "submitted_at": markettime.fmt_et(o.submitted_at) if o.submitted_at else None,
+        }
+        for orders in portfolio.pending_orders.values()
+        for o in orders
+    ]
+
+    # A case whose position isn't in the book yet. Normally the other half of
+    # an in-flight buy; with nothing in flight it is a case for something the
+    # account does not own, which no position review would ever surface.
+    cases_not_yet_held = [
+        {
+            "symbol": symbol,
+            "opened_at": markettime.fmt_et(t.opened_at),
+            "why_we_own_it": t.thesis,
+            "target": t.target,
+            "invalidation": t.invalidation,
+            "explained_by_pending_order": symbol in portfolio.pending_orders,
+        }
+        for symbol, t in sorted(theses.items())
+        if symbol not in portfolio.positions
+    ]
+
     state = {
         "as_of": markettime.fmt_et(portfolio.timestamp),
         "cash": round(portfolio.cash, 2),
         "equity": round(portfolio.equity, 2),
+        "min_cash_buffer_usd": round(min_cash_required, 2),
+        # Cash above the buffer, before accounting for orders already placed.
+        "deployable_cash": round(deployable_cash, 2),
+        # What pending buys will take out of that when they fill.
+        "committed_to_pending_buys": round(portfolio.pending_buy_commitment, 2),
+        # The figure to size new buys against. Sell proceeds are not included:
+        # they are unsettled, and validation will not credit them.
+        "uncommitted_cash": round(uncommitted_cash, 2),
+        **(
+            {"pending_buys_of_unknown_value": portfolio.unpriced_pending_buys}
+            if portfolio.unpriced_pending_buys else {}
+        ),
+        # Not reflected in cash or positions above — see the prompt's
+        # ORDERS ALREADY IN FLIGHT section.
+        "orders_in_flight": orders_in_flight,
+        "cases_not_yet_held": cases_not_yet_held,
         "positions": positions_summary,
         "watchlist_prices": {s: market.prices.get(s) for s in market.watchlist},
         # Kept separate on purpose. position_news is complete — every holding was
@@ -423,8 +712,11 @@ def build_decision_prompt(
         "Current portfolio and market state (JSON):\n"
         f"{json.dumps(state, indent=2)}\n\n"
         "Review every open position against its stored thesis and return a verdict "
-        "for each. Then decide on trades for this cycle — including none, if none "
-        "are warranted."
+        "for each, re-anchoring any case whose written marker has expired. Then "
+        "decide on trades for this cycle — including none, if none are warranted. "
+        "Buys are limited to uncommitted_cash; if the capital you want is inside a "
+        "position you rate lower, start the rotation rather than recording another "
+        "day of having no room."
     )
 
 
@@ -535,8 +827,37 @@ def validate_trades(
     Invalid trades are rejected, never silently adjusted.
     """
     results: list[ValidatedTrade] = []
-    running_cash = portfolio.cash
+    # Cash the account holds, less what orders already at the broker will take
+    # out of it when they fill. Validating against raw cash would approve a buy
+    # that breaches the buffer the moment a pending order fills — no single
+    # decision looking wrong, the account overdrawn against its own floor
+    # anyway. This is the same principle as refusing to credit an unsettled
+    # sell: only money that is both present and unspoken-for can fund a buy.
+    running_cash = portfolio.cash - portfolio.pending_buy_commitment
+    # Two baselines, because the buy cap and the sell check need opposite
+    # kinds of caution about the same pending orders.
+    #
+    # `position_values` is what is still disposable, and gates sells. A pending
+    # buy must NOT count here: those shares have not arrived, and treating them
+    # as sellable is how a long-only account ends up short. A pending sell IS
+    # netted off, or the same shares could be sold twice — once by the order in
+    # flight and again by this cycle's proposal.
+    #
+    # `cap_values` is where the book is heading, and gates the 15% cap. A
+    # pending buy DOES count here, or a second buy could take a position past
+    # the cap the moment both fill. Pending sells are not netted off there:
+    # assuming a position is already smaller would loosen the cap on the
+    # strength of an order that has not filled, and the cap should only ever
+    # err toward strictness.
     position_values = {s: p.market_value for s, p in portfolio.positions.items()}
+    cap_values = dict(position_values)
+    for symbol, sold in portfolio.pending_sell_value.items():
+        if symbol in position_values:
+            position_values[symbol] = max(0.0, position_values[symbol] - sold)
+    for symbol, orders in portfolio.pending_orders.items():
+        for o in orders:
+            if o.side == "buy" and o.notional_usd is not None:
+                cap_values[symbol] = cap_values.get(symbol, 0.0) + o.notional_usd
     equity = portfolio.equity
     min_cash_required = config.MIN_CASH_BUFFER_PCT * equity
 
@@ -607,7 +928,7 @@ def validate_trades(
                 results.append(ValidatedTrade(trade, False, "cannot size position against non-positive equity"))
                 continue
 
-            projected_position_value = position_values.get(trade.symbol, 0.0) + trade.notional_usd
+            projected_position_value = cap_values.get(trade.symbol, 0.0) + trade.notional_usd
             if projected_position_value / equity > config.MAX_POSITION_PCT:
                 results.append(ValidatedTrade(trade, False, "exceeds max position size (15%)"))
                 continue
@@ -618,7 +939,9 @@ def validate_trades(
                 results.append(ValidatedTrade(trade, False, "would breach minimum cash buffer (5%)"))
                 continue
             running_cash -= trade.notional_usd
-            position_values[trade.symbol] = projected_position_value
+            cap_values[trade.symbol] = projected_position_value
+            # Bought shares are not sellable until they arrive, so this buy
+            # does not raise what a later sell in this same list may dispose of.
             results.append(ValidatedTrade(trade, True))
 
         else:  # sell
@@ -630,12 +953,25 @@ def validate_trades(
                 ))
                 continue
 
+            # An unfilled sell of unknowable size leaves no way to tell how much
+            # of the holding is still disposable. Refuse rather than guess.
+            if trade.symbol in portfolio.unvaluable_pending_sells:
+                results.append(ValidatedTrade(
+                    trade, False,
+                    "unfilled sell of unknown size for this symbol; cannot size a further sell",
+                ))
+                continue
+
             held_value = position_values.get(trade.symbol, 0.0)
             if held_value <= 0:
+                # Covers both "never held" and "the whole position is already
+                # being sold by an order in flight".
                 results.append(ValidatedTrade(trade, False, "no position held (long-only, no shorting)"))
                 continue
             if trade.notional_usd > held_value:
-                results.append(ValidatedTrade(trade, False, "cannot sell more than held position"))
+                results.append(ValidatedTrade(
+                    trade, False, "cannot sell more than held position (net of unfilled sells)"
+                ))
                 continue
             # Deliberately does NOT credit running_cash. The sell has not been
             # submitted yet, let alone filled or settled, so spending its
@@ -654,12 +990,36 @@ def validate_trades(
 # Stage 4: Execute
 # ---------------------------------------------------------------------------
 
-def execute_trades(trades: list[ValidatedTrade], mode: str) -> list[dict[str, Any]]:
+def _client_order_id(trade: ProposedTrade, session_date: str) -> str:
+    """A broker-side idempotency key: one identical order per symbol per session.
+
+    Orders are placed before the cycle is logged, so a crash between the two
+    leaves real fills the database never recorded — and rerunning the day would
+    place them a second time. The broker rejects a duplicate client_order_id,
+    which turns that second attempt into a no-op instead of a double position.
+
+    Keyed on what the order *is* (session, symbol, side, amount in cents) rather
+    than on its position in the list: a rerun re-asks Claude and gets a fresh
+    decision, so an index would suppress whichever unrelated trade happened to
+    land in the same slot while letting a genuine repeat through. Since the
+    agent decides once per session, a second identical order the same day is a
+    rerun artifact by construction.
+    """
+    symbol = "".join(ch for ch in trade.symbol.upper() if ch.isalnum())
+    cents = int(round(trade.notional_usd * 100))
+    return f"agt-{session_date}-{symbol}-{trade.side}-{cents}"
+
+
+def execute_trades(
+    trades: list[ValidatedTrade], mode: str, session_date: str
+) -> list[dict[str, Any]]:
     """Place validated orders through the Alpaca trading API.
 
     Args:
         trades: Trades that passed validation (only is_valid=True trades are sent).
         mode: "paper" or "live" — selects which Alpaca base URL to use.
+        session_date: Market-calendar date ('2026-09-03') scoping the
+            idempotency key, so a rerun of the same session cannot double-order.
 
     Returns:
         Order confirmation records as returned by Alpaca.
@@ -693,6 +1053,7 @@ def execute_trades(trades: list[ValidatedTrade], mode: str) -> list[dict[str, An
                 notional=round(trade.notional_usd, 2),
                 side=OrderSide.BUY if trade.side == "buy" else OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
+                client_order_id=_client_order_id(trade, session_date),
             )
             order = client.submit_order(order_data=order_request)
             order_record["order_id"] = str(order.id)
@@ -701,7 +1062,16 @@ def execute_trades(trades: list[ValidatedTrade], mode: str) -> list[dict[str, An
             # Submission failed, so no fill exists for this trade — but the
             # attempt still belongs in the log. A thesis must not be opened off
             # an order that never reached the broker.
-            order_record["status"] = f"submit_failed: {type(exc).__name__}: {exc}"
+            #
+            # A rejected duplicate key is called out separately because it means
+            # the opposite of the other failures: the order is not missing, it
+            # already exists from an earlier run of this same session, and the
+            # guard did its job. It is still submit_failed for this run — this
+            # invocation placed nothing, and the fill it is pointing at was
+            # already logged (or lost) by the run that actually made it.
+            duplicate = "client_order_id" in str(exc).lower() or "duplicate" in str(exc).lower()
+            prefix = "duplicate_suppressed" if duplicate else "submit_failed"
+            order_record["status"] = f"{prefix}: {type(exc).__name__}: {exc}"
             validated.order = order_record
             validated.submit_failed = True
             orders.append(order_record)
@@ -760,7 +1130,29 @@ def init_db(db_path: str) -> sqlite3.Connection:
             invalidation TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'open',
             closed_at TEXT,
-            exit_trigger TEXT
+            exit_trigger TEXT,
+            updated_at TEXT,
+            revision INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    # Every version a case has ever had, including the one it was opened with.
+    # `theses` holds only the current wording; without this table a re-anchor
+    # would quietly rewrite history and the record would show a position that
+    # had always been owned for whatever reason it is owned for today.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS thesis_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            cycle_id INTEGER REFERENCES decision_cycles(id),
+            revised_at TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            -- 'open' | 'buy_refresh' | 'adopt' | 'review_reanchor'
+            source TEXT NOT NULL,
+            thesis TEXT NOT NULL,
+            target TEXT NOT NULL,
+            invalidation TEXT NOT NULL
         )
         """
     )
@@ -796,19 +1188,59 @@ def init_db(db_path: str) -> sqlite3.Connection:
         ON theses (symbol) WHERE status = 'open'
         """
     )
+    _migrate_thesis_revisions(conn)
     conn.commit()
     return conn
+
+
+def _migrate_thesis_revisions(conn: sqlite3.Connection) -> None:
+    """Bring a pre-revision `theses` table up to the current schema.
+
+    CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so databases
+    created before case re-anchoring existed need the new columns added and
+    their current wording backfilled as revision 1 — otherwise the first
+    re-anchor would look like the second version of a case with no first.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(theses)")}
+    if "revision" in columns:
+        return
+    conn.execute("ALTER TABLE theses ADD COLUMN updated_at TEXT")
+    conn.execute("ALTER TABLE theses ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+    # cycle_id is left null: these predate the trail, and the cycle that opened
+    # them is recoverable from opened_at if it is ever needed.
+    conn.execute(
+        """
+        INSERT INTO thesis_revisions
+            (symbol, cycle_id, revised_at, revision, source, thesis, target, invalidation)
+        SELECT symbol, NULL, opened_at, 1, 'open', thesis, target, invalidation
+        FROM theses
+        """
+    )
 
 
 def fetch_open_theses(conn: sqlite3.Connection) -> dict[str, Thesis]:
     """Load the standing investment case for every currently-held position."""
     rows = conn.execute(
         """
-        SELECT symbol, opened_at, thesis, target, invalidation, status, closed_at, exit_trigger
+        SELECT symbol, opened_at, thesis, target, invalidation, status, closed_at,
+               exit_trigger, updated_at, revision
         FROM theses WHERE status = 'open'
         """
     ).fetchall()
     return {r[0]: Thesis(*r) for r in rows}
+
+
+CASE_FIELDS = ("thesis", "target", "invalidation")
+
+
+def _full_case(obj: Any) -> tuple[str, str, str] | None:
+    """The three case fields off a review or trade, or None if any is missing.
+
+    A case is all-or-nothing: a target rewritten without its matching
+    invalidation describes a position nobody could later be held to.
+    """
+    values = tuple((getattr(obj, f) or "").strip() for f in CASE_FIELDS)
+    return values if all(values) else None  # type: ignore[return-value]
 
 
 def apply_thesis_lifecycle(
@@ -817,33 +1249,96 @@ def apply_thesis_lifecycle(
     reviews: list[PositionReview],
     portfolio: PortfolioState,
     timestamp: datetime,
-) -> None:
-    """Open, carry, and close theses in response to executed trades and reviews.
+    cycle_id: int,
+) -> dict[str, int]:
+    """Open, carry, re-anchor, and close theses from executed trades and reviews.
 
     A buy opens a thesis (or refreshes the existing one when adding to a winner).
     A sell that closes out the whole position closes the thesis; a partial sell
     leaves it open, since the case still stands on the remaining shares.
 
-    A review may also adopt an untracked position by supplying a full case —
-    that is how holdings opened before thesis tracking get one without having
-    to be sold and rebought.
+    A review may adopt an untracked position by supplying a full case — that is
+    how holdings opened before thesis tracking get one without having to be sold
+    and rebought — or **re-anchor** the case on a position that already has one.
+    Re-anchoring matters because a stored target that has been passed keeps
+    firing as if it were still a decision criterion: MSFT was trimmed six times
+    over five weeks against a "$420+" target it had already cleared by 19%,
+    because the only way to change the wording was to sell the position and buy
+    it back. Every version is kept in `thesis_revisions`, so a rewrite is a
+    dated amendment rather than a quiet edit of the record.
+
+    Returns per-outcome counts for the cycle summary. An incomplete case on a
+    review is counted, not applied — silently dropping it is what let the model
+    report re-anchoring a thesis that never changed.
     """
     now = timestamp.isoformat()
-    open_symbols = set(fetch_open_theses(conn))
+    open_theses = fetch_open_theses(conn)
+    counts = {
+        "opened": 0, "adopted": 0, "reanchored": 0,
+        "closed": 0, "incomplete": 0, "orphaned": 0,
+    }
 
-    for r in reviews:
-        if r.symbol in open_symbols or r.symbol not in portfolio.positions:
-            continue
-        if all((getattr(r, f) or "").strip() for f in ("thesis", "target", "invalidation")):
+    def record_revision(symbol: str, revision: int, source: str, case: tuple[str, str, str]) -> None:
+        conn.execute(
+            """
+            INSERT INTO thesis_revisions
+                (symbol, cycle_id, revised_at, revision, source, thesis, target, invalidation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (symbol, cycle_id, now, revision, source, *case),
+        )
+
+    def write_case(symbol: str, source: str, case: tuple[str, str, str]) -> None:
+        """Open a new case, or supersede the standing one, keeping both on record."""
+        existing = open_theses.get(symbol)
+        if existing is None:
             conn.execute(
                 """
-                INSERT INTO theses (symbol, opened_at, thesis, target, invalidation, status)
-                VALUES (?, ?, ?, ?, ?, 'open')
-                ON CONFLICT (symbol) WHERE status = 'open' DO NOTHING
+                INSERT INTO theses
+                    (symbol, opened_at, thesis, target, invalidation, status, revision)
+                VALUES (?, ?, ?, ?, ?, 'open', 1)
                 """,
-                (r.symbol, now, r.thesis, r.target, r.invalidation),
+                (symbol, now, *case),
             )
-            open_symbols.add(r.symbol)
+            record_revision(symbol, 1, source, case)
+            open_theses[symbol] = Thesis(symbol, now, *case)
+            return
+
+        revision = existing.revision + 1
+        conn.execute(
+            """
+            UPDATE theses
+               SET thesis = ?, target = ?, invalidation = ?, updated_at = ?, revision = ?
+             WHERE symbol = ? AND status = 'open'
+            """,
+            (*case, now, revision, symbol),
+        )
+        record_revision(symbol, revision, source, case)
+        open_theses[symbol] = replace(
+            existing,
+            thesis=case[0], target=case[1], invalidation=case[2],
+            updated_at=now, revision=revision,
+        )
+
+    for r in reviews:
+        # A review can only speak for something actually held. A verdict on a
+        # symbol not in the book is stale or hallucinated either way.
+        if r.symbol not in portfolio.positions:
+            continue
+        existing = open_theses.get(r.symbol)
+        case = _full_case(r)
+        if case is None:
+            # Partial case fields on a review: the model tried to say something
+            # about the standing case and it did not take.
+            if any((getattr(r, f) or "").strip() for f in CASE_FIELDS):
+                counts["incomplete"] += 1
+            continue
+        if existing is None:
+            write_case(r.symbol, "adopt", case)
+            counts["adopted"] += 1
+        elif case != (existing.thesis, existing.target, existing.invalidation):
+            write_case(r.symbol, "review_reanchor", case)
+            counts["reanchored"] += 1
 
     for v in validated_trades:
         if not v.is_valid or v.order is None or v.submit_failed:
@@ -851,17 +1346,15 @@ def apply_thesis_lifecycle(
         trade = v.trade
 
         if trade.side == "buy":
-            conn.execute(
-                """
-                INSERT INTO theses (symbol, opened_at, thesis, target, invalidation, status)
-                VALUES (?, ?, ?, ?, ?, 'open')
-                ON CONFLICT (symbol) WHERE status = 'open'
-                DO UPDATE SET thesis = excluded.thesis,
-                              target = excluded.target,
-                              invalidation = excluded.invalidation
-                """,
-                (trade.symbol, now, trade.thesis, trade.target, trade.invalidation),
-            )
+            case = _full_case(trade)
+            if case is None:
+                # Unreachable via validate_trades, which rejects such a buy
+                # before it can be ordered. Guarded anyway: writing NULL into a
+                # NOT NULL column here would abort the whole cycle's logging.
+                continue
+            is_new = trade.symbol not in open_theses
+            write_case(trade.symbol, "open" if is_new else "buy_refresh", case)
+            counts["opened" if is_new else "reanchored"] += 1
         else:
             held_value = portfolio.positions[trade.symbol].market_value
             # Treat a near-total sell as a full exit; market fills rarely land exact.
@@ -873,7 +1366,62 @@ def apply_thesis_lifecycle(
                     """,
                     (now, trade.exit_trigger, trade.symbol),
                 )
+                open_theses.pop(trade.symbol, None)
+                counts["closed"] += 1
+
+    counts["orphaned"] = _close_orphaned_theses(
+        conn, open_theses, portfolio, now,
+        traded={v.trade.symbol for v in validated_trades if v.is_valid and not v.submit_failed},
+    )
     conn.commit()
+    return counts
+
+
+# Written only by code, never proposed by the model, so it is deliberately not
+# in config.VALID_EXIT_TRIGGERS — it records an absence, not a decision.
+ORPHAN_EXIT_TRIGGER = "position_gone"
+
+
+def _close_orphaned_theses(
+    conn: sqlite3.Connection,
+    open_theses: dict[str, Thesis],
+    portfolio: PortfolioState,
+    now: str,
+    traded: set[str],
+) -> int:
+    """Close cases whose position is gone and has nothing in flight to explain it.
+
+    A case is only ever shown to the model attached to a held position, so one
+    without a position is invisible: it can never be reviewed, and no sell can
+    close it because there is nothing to sell. Left alone it stays open forever
+    and blocks the symbol's next buy from opening a fresh case.
+
+    Three things are treated as explaining an absent position, and none of them
+    is an orphan: an unfilled order still at the broker, a trade placed in this
+    very cycle (the snapshot predates it), and an empty position list. That last
+    one is the important guard — a broker call that returns no positions is far
+    more likely to be a glitch than a liquidated account, and closing every case
+    at once on that reading is unrecoverable.
+    """
+    if not portfolio.positions:
+        return 0
+
+    orphans = [
+        symbol for symbol in open_theses
+        if symbol not in portfolio.positions
+        and symbol not in portfolio.pending_orders
+        and symbol not in traded
+    ]
+    for symbol in orphans:
+        conn.execute(
+            """
+            UPDATE theses SET status = 'closed', closed_at = ?, exit_trigger = ?
+            WHERE symbol = ? AND status = 'open'
+            """,
+            (now, ORPHAN_EXIT_TRIGGER, symbol),
+        )
+        open_theses.pop(symbol, None)
+    return len(orphans)
 
 
 def log_run(
@@ -1001,18 +1549,28 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         now = markettime.now_utc()
         portfolio = fetch_portfolio_state(mode)
         market = fetch_market_context(watchlist, portfolio)
+        # Needs prices, so it runs here rather than in fetch_portfolio_state.
+        # Must precede both the prompt and validation — they read the result.
+        price_pending_orders(portfolio, market.prices)
         theses = fetch_open_theses(conn)
         prompt = build_decision_prompt(portfolio, market, theses, now)
         trades, reviews, raw_response = get_claude_decision(prompt)
         validated = validate_trades(trades, portfolio, mode)
-        execute_trades(validated, mode)
-        apply_thesis_lifecycle(conn, validated, reviews, portfolio, now)
+        execute_trades(validated, mode, markettime.fmt_et_date(now))
+        # Logged before the lifecycle runs so the audit record of what was
+        # decided exists before any state derived from it, and so revisions can
+        # name the cycle that made them.
         cycle_id = log_decision_cycle(
             conn, prompt, raw_response, validated, reviews, portfolio, now, mode,
         )
+        thesis_counts = apply_thesis_lifecycle(
+            conn, validated, reviews, portfolio, now, cycle_id,
+        )
         cycles_completed = 1
         prompt_path = write_prompt_log(cycle_id, prompt, mode, now)
-        _print_cycle_summary(cycle_id, now, validated, reviews, prompt_path)
+        _print_cycle_summary(
+            cycle_id, now, validated, reviews, thesis_counts, portfolio, prompt_path,
+        )
     except Exception:
         # Record the failure before the exception propagates and exits non-zero.
         log_run(conn, "failed", traceback.format_exc(), cycles_completed)
@@ -1028,6 +1586,8 @@ def _print_cycle_summary(
     timestamp: datetime,
     validated: list[ValidatedTrade],
     reviews: list[PositionReview],
+    thesis_counts: dict[str, int],
+    portfolio: PortfolioState,
     prompt_path: str,
 ) -> None:
     """Five-line cycle summary — this is what lands in the launchd log.
@@ -1046,6 +1606,25 @@ def _print_cycle_summary(
     # it is only visible by reading the trades table.
     if failed:
         print(f"  FAILED AT BROKER        {failed}")
+    in_flight = sum(len(v) for v in portfolio.pending_orders.values())
+    if in_flight:
+        # Normally zero: the previous cycle's orders fill before this one runs.
+        print(f"  orders in flight        {in_flight} (unfilled, from an earlier run)")
+    changed = {
+        k: n for k, n in thesis_counts.items()
+        if n and k not in ("incomplete", "orphaned")
+    }
+    if changed:
+        print("  theses                  "
+              + ", ".join(f"{n} {k}" for k, n in changed.items()))
+    # A case for something the account does not own, with nothing in flight to
+    # explain it — closed here, but worth seeing rather than inferring.
+    if thesis_counts.get("orphaned"):
+        print(f"  ORPHANED CASES CLOSED   {thesis_counts['orphaned']}")
+    # A case the model tried to rewrite and couldn't is a prompt problem, not a
+    # quiet no-op: it will keep reasoning against wording it thinks it changed.
+    if thesis_counts.get("incomplete"):
+        print(f"  INCOMPLETE CASE IGNORED {thesis_counts['incomplete']}")
     print(f"  prompt                  {prompt_path}")
 
 

@@ -32,7 +32,7 @@ The system is a scheduled loop:
 └─────────────┘    └──────────────┘    └────────────┘    └───────────┘    └─────────┘
 ```
  
-1. **Gather state** — pull current positions, cash, and P&L from the Alpaca API; fetch current prices and recent news for holdings and the watchlist.
+1. **Gather state** — pull current positions, cash, P&L, and any unfilled orders from the Alpaca API; fetch current prices and recent news for holdings and the watchlist. Unfilled orders are gathered because an accepted order moves neither cash nor positions until it fills: the agent decides after the close, its orders queue until the next open, and a cycle that runs in between would otherwise see an untouched portfolio and place the same trade twice.
 2. **Decision** — send the full state to the Claude API (Anthropic `/v1/messages`) with instructions to output trades as structured JSON, each with written reasoning.
 3. **Validate** — code (not a human) checks every proposed trade against the guardrails below. Invalid trades are rejected and logged; valid trades proceed.
 4. **Execute** — place validated orders through the Alpaca trading API (paper first, then live).
@@ -44,13 +44,15 @@ The agent is fully autonomous, but it operates inside hard constraints:
  
 | Rule | Value |
 |---|---|
-| Max position size | 15% of portfolio per ticker |
+| Max position size | 15% of portfolio per ticker, measured against holdings **plus** unfilled buys, so two orders cannot together breach it. Unfilled buys are deliberately *not* counted as holdings for sells — shares that have not arrived must not be sellable |
 | Universe | Long-only, whitelisted US equities/ETFs — S&P 1500 ∪ Nasdaq-100 (1,519 symbols) |
 | Leverage / margin / options | Not permitted. Buys are funded only from cash already settled at the start of the cycle — proceeds from a sell in the same cycle are **not** spendable, since that sell has not filled yet and a margin account would fund the gap as leverage |
-| Minimum cash buffer | 5% |
+| Unfilled orders | Neither cash nor positions moves until an order fills, so both are double-countable while one is in flight. Sells are checked against the position **net of unfilled sells** (the same shares cannot be sold twice) and unfilled buys are never treated as sellable (shares that have not arrived must not be disposable). A pending order too ambiguous to value blocks further sells of that symbol rather than being estimated |
+| Minimum cash buffer | 5%, measured against cash **net of unfilled buy orders**. An accepted order has not touched cash yet, so raw cash overstates what is spendable by the size of that order — enough to breach the buffer on fill without any single decision looking wrong |
 | Max trades per decision cycle | 5 |
 | Minimum trade size | $1 notional (the broker's floor) |
 | Ticker validation | Every symbol verified against the broker asset list before ordering. The whitelist gates **buys** only — a held position whose ticker later leaves the index must always remain sellable |
+| Order idempotency | Every order carries a deterministic `client_order_id` (session date + symbol + side + amount). Orders are placed before the cycle is logged, so a crash between the two leaves fills the database never recorded; the broker rejects the duplicate on a rerun rather than doubling the position |
 | Live-trading lock | `--mode live` refuses to run unless `TRADING_AGENT_ALLOW_LIVE` is set explicitly in the shell. Paper is the only thing reachable by accident |
 
 Enforcement lives in `validate_trades()` and is checked at the single broker-client
@@ -61,9 +63,20 @@ value would otherwise satisfy all of them.
 
 **Trade frequency.** The agent runs once daily after the close, not weekly as originally
 designed. Nothing in code enforces a trade-frequency limit; "most days should be zero
-trades" is instruction to the model, not a guardrail. On a paper account this is
-harmless, but PDT rules apply to live accounts under $25k — this needs a code-enforced
-limit before Phase 2, or it is the one advisory rule in an otherwise code-enforced set.
+trades" is instruction to the model, not a guardrail — the one advisory rule in an
+otherwise code-enforced set. The PDT rule this was originally meant to guard against
+cannot actually bind: pattern-day-trading counts same-session round trips, and an agent
+that decides once after the close and holds overnight has no way to make one. The real
+observed risk runs the other way — see below.
+
+**What the guardrails have actually caught: nothing.** Over the first 28 cycles, all 21
+proposed trades passed validation and none were rejected. The set is worth keeping —
+it is what makes autonomy safe to run unattended, and an untriggered guardrail is doing
+its job — but the binding constraint on this agent is inertia, not permissiveness: 20 of
+28 cycles proposed no trades at all, review verdicts ran 244 `hold` / 6 `trim` / 0
+`exit`, and not one thesis has been closed, so the exit path has never executed in
+production. Any new rule proposed here should first be checked against
+`trades.rejection_reason` for evidence the existing ones bind.
 
 ## Thesis Lifecycle
 
@@ -76,6 +89,16 @@ auditable rather than merely active.
 - **Carrying.** Each stored thesis is replayed into every subsequent prompt alongside
   that position's current price, unrealised P&L, and days held — so the agent argues
   against its own prior reasoning instead of forming a fresh opinion daily.
+- **Re-anchoring.** A case can go stale without going wrong: the commonest failure is a
+  price marker in `target` being passed while the operating condition it stood in for
+  still holds. A review may rewrite the case in place by supplying all three fields
+  again, and every version is kept and dated in `thesis_revisions`, so a rewrite is an
+  amendment on the record rather than an edit to history. This was not always possible,
+  and the cost showed: MSFT was trimmed six separate times over five weeks against a
+  "$420+" target it had already cleared by 19%, because selling and rebuying was the
+  only way to change the wording. The prompt shows the revision count back to the agent
+  precisely so that ratcheting a target behind a rising price stays visible as the
+  goalpost-moving it would be.
 - **Reviewing.** Every cycle returns a verdict for *every* open position — `hold`,
   `trim`, or `exit` — even on days with no trades. A `trim`/`exit` verdict with no
   matching sell is recorded as the agent contradicting itself, and surfaces on the
@@ -83,18 +106,39 @@ auditable rather than merely active.
 - **Closing.** Every sell must name a valid exit trigger — `thesis_broken`,
   `target_hit`, `bad_news`, `no_longer_fits`, or `risk`. This is enforced, not advisory:
   a sell without one is rejected. Positions cannot be closed on price drift alone.
+- **Orphans.** A case is only ever shown to the agent attached to a held position, so a
+  case whose position is gone — an order that never filled, a holding disposed of
+  outside the agent — receives no review and cannot be closed by a sell, because there
+  is nothing to sell. These are detected and closed by code, marked `position_gone` to
+  distinguish an absence from a decision. Orders still in flight and trades placed in
+  the same cycle are not orphans, and an empty position list is treated as a broker
+  glitch rather than a liquidated account.
 
 
 ## Rollout Phases
  
 - **Phase 1 — Paper (4–8 weeks):** identical code, Alpaca paper-trading keys. Goal: shake out bugs, verify logging, watch behavior.
 - **Phase 2 — Live (small):** swap to live API keys with a small, loss-tolerable amount of capital.
-- **Phase 3 — Project layer:** performance dashboard vs. SPY, automated trade-reasoning writeups, optional auto-posting.
+- **Phase 3 — Project layer:** performance dashboard vs. SPY, automated trade-reasoning writeups, optional auto-posting. (The dashboard is built — `dashboard.py`.)
+
+Phase 1 is not finished. The gate for Phase 2 is not elapsed time but evidence the full
+lifecycle works end to end, and one arc has never run: no thesis has been closed, so the
+`exit_trigger` path has executed exactly zero times outside tests. Going live on an
+untested exit is going live on the half of the system that decides when to stop losing
+money.
 ## Evaluation Metrics
  
 **Performance:** Total Return (%), Annualized Return, Alpha vs. S&P 500, Sharpe Ratio, Maximum Drawdown
  
 **Behavioral:** Turnover rate, consistency of decisions, reaction to volatility/news events, frequency of rejected (guardrail-violating) proposals
+
+**Measurement window.** All of these are computed from the first decision cycle to the
+present, never a rolling lookback. This is not a detail: the dashboard originally asked
+Alpaca for a fixed `period="1M"`, which meant the window moved forward every day and
+eventually started *after* the portfolio had been built. On 2026-09-02 that reported
++0.18% agent vs. +0.52% SPY — alpha of **−0.34pp** — while the since-inception figures
+for the same account were +4.17% vs. +1.37%, alpha of **+2.80pp**. A benchmark
+comparison that silently redefines its own start date reverses its own conclusion.
  
 ## Data Sources
  
