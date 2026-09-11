@@ -472,6 +472,32 @@ with no new operating information, the honest conclusion is that you never had a
 price view worth writing down — anchor the case to the business condition you \
 actually own instead.
 
+YOUR OWN TRACK RECORD
+
+Every position carries "your_track_record": the trades you have already proposed in \
+that name, with the reasoning you gave at the time, and a tally of the review \
+verdicts you have returned on it. This is your record, not market data. Rejected and \
+unexecuted proposals appear too, labelled — an intention you had is not a fill you got.
+
+Read it before acting on a name you have acted on before. It exists because of two \
+failures that are invisible from position weight alone:
+
+- Re-deciding. If your reasoning today restates the reasoning on an earlier action \
+  in the same name, you are not responding to new information — you are meeting the \
+  same fact again and treating it as news. An observation you have already acted on \
+  is spent. Name what has changed since that action, or do not act. Trimming a \
+  winner five times against one passed price marker is this failure, not discipline.
+- Drifting past your own intentions. If an earlier reasoning said where you meant to \
+  stop — a target weight, a number of tranches, a condition for the next add — that \
+  is a commitment and you are held to it. Meet it, or say in your commentary that \
+  you are departing from it and why. Exceeding it without remarking on it is the \
+  failure; nothing in code will catch it.
+
+Building a position in tranches is legitimate and often correct. Doing it three times \
+without noticing you are doing it is a different thing, and only you can tell them \
+apart. A long run of "hold" verdicts is likewise not evidence that a position is \
+fine — it may equally mean you have stopped genuinely examining it.
+
 WHAT THE NEWS FIELDS MEAN
 
 "position_news" is complete: every open position was looked up individually, so an \
@@ -583,6 +609,7 @@ def build_decision_prompt(
     portfolio: PortfolioState,
     market: MarketContext,
     theses: dict[str, Thesis],
+    actions: dict[str, dict[str, Any]],
     as_of: datetime,
 ) -> str:
     """Assemble the prompt sent to Claude, instructing it to return trades as
@@ -591,6 +618,12 @@ def build_decision_prompt(
     Each held position is paired with the thesis Claude wrote when it opened
     that position, plus unrealised P&L and days held, so the model reviews its
     own standing case rather than forming a fresh opinion every cycle.
+
+    It is also paired with `your_track_record` — what Claude has actually *done*
+    in that name before, in its own words. The case and the record answer
+    different questions ("what do I believe?" versus "what have I already done
+    about it?"), and a model given only the first re-derives the second from
+    position weight, which is how the same conclusion gets acted on repeatedly.
     """
     positions_summary = []
     for p in portfolio.positions.values():
@@ -634,6 +667,11 @@ def build_decision_prompt(
                 "No stored thesis for this position. Either write one by "
                 "reviewing it as 'hold' with a note stating the case, or exit it."
             )
+        # What this agent has already done in this name. Attached to the
+        # position rather than listed separately so it is unavoidable at the
+        # moment the position is being judged.
+        if p.symbol in actions:
+            row["your_track_record"] = actions[p.symbol]
         positions_summary.append(row)
 
     # Computed here rather than left to the model. It had been re-deriving
@@ -673,6 +711,7 @@ def build_decision_prompt(
             "target": t.target,
             "invalidation": t.invalidation,
             "explained_by_pending_order": symbol in portfolio.pending_orders,
+            **({"your_track_record": actions[symbol]} if symbol in actions else {}),
         }
         for symbol, t in sorted(theses.items())
         if symbol not in portfolio.positions
@@ -716,7 +755,9 @@ def build_decision_prompt(
         "decide on trades for this cycle — including none, if none are warranted. "
         "Buys are limited to uncommitted_cash; if the capital you want is inside a "
         "position you rate lower, start the rotation rather than recording another "
-        "day of having no room."
+        "day of having no room. Before proposing a trade in a name you have traded "
+        "before, read your own track record for it and say what has changed since "
+        "that action — or do not act."
     )
 
 
@@ -1230,6 +1271,108 @@ def fetch_open_theses(conn: sqlite3.Connection) -> dict[str, Thesis]:
     return {r[0]: Thesis(*r) for r in rows}
 
 
+def fetch_action_history(
+    conn: sqlite3.Connection, limit_per_symbol: int = config.ACTION_HISTORY_LIMIT
+) -> dict[str, dict[str, Any]]:
+    """Every trade this agent has previously proposed, grouped by symbol.
+
+    The stored thesis tells the model what it *believed* about a name. This
+    tells it what it *did* about it, in its own words at the time. Without the
+    second half the only trace of a past action is the position's current
+    weight, so a conclusion already acted on reads as new every cycle: MSFT was
+    trimmed six times against one expired price marker, each trim restating the
+    previous one's reasoning, and three separate cycles each independently
+    decided to size GD up — the third exceeding the ~6-7% ceiling the first had
+    written down for itself, because nothing carried that sentence forward.
+
+    Rejected proposals are kept. A trade the guardrails refused is still a
+    decision this agent made, and re-proposing it unchanged is precisely the
+    repetition this is meant to surface. Trades that never reached the broker
+    are labelled as such, so an intention is never read back as a fill.
+
+    Only the most recent `limit_per_symbol` actions per name are returned; the
+    summary line still counts them all, so truncation loses detail but never
+    the fact that earlier actions happened.
+    """
+    rows = conn.execute(
+        """
+        SELECT t.symbol, t.cycle_id, d.timestamp, t.side, t.notional_usd,
+               t.reasoning, t.is_valid, t.rejection_reason, t.order_status
+        FROM trades t JOIN decision_cycles d ON d.id = t.cycle_id
+        ORDER BY t.symbol, t.cycle_id
+        """
+    ).fetchall()
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for (symbol, cycle_id, ts, side, notional, reasoning,
+         is_valid, rejection, order_status) in rows:
+        status = order_status or ""
+        if not is_valid:
+            outcome = f"REJECTED by guardrails — {rejection}"
+        elif status.startswith("duplicate_suppressed"):
+            outcome = "not sent — duplicate of an order already at the broker"
+        elif status.startswith("submit_failed"):
+            outcome = f"NOT EXECUTED — {status}"
+        else:
+            outcome = "executed"
+        grouped.setdefault(symbol, []).append({
+            "cycle": cycle_id,
+            "date": markettime.fmt_et_date(ts),
+            "side": side,
+            "notional_usd": notional,
+            "outcome": outcome,
+            "your_reasoning_at_the_time": reasoning,
+        })
+
+    # Verdict tallies are near-free next to the notes that produced them, and
+    # they are what makes a streak visible: a name held through thirty reviews
+    # has been actively re-decided thirty times, which reads very differently
+    # from never having been examined.
+    verdicts: dict[str, dict[str, int]] = {}
+    for symbol, verdict, n in conn.execute(
+        """
+        SELECT symbol, verdict, COUNT(*) FROM position_reviews
+        GROUP BY symbol, verdict
+        """
+    ):
+        verdicts.setdefault(symbol, {})[verdict] = n
+
+    history: dict[str, dict[str, Any]] = {}
+    for symbol in set(grouped) | set(verdicts):
+        actions = grouped.get(symbol, [])
+        record: dict[str, Any] = {}
+        if actions:
+            executed = [a for a in actions if a["outcome"] == "executed"]
+            bought = sum(a["notional_usd"] for a in executed if a["side"] == "buy")
+            sold = sum(a["notional_usd"] for a in executed if a["side"] == "sell")
+            parts = []
+            if bought:
+                n = sum(1 for a in executed if a["side"] == "buy")
+                parts.append(f"{n} buy{'s' if n > 1 else ''} totalling ${bought:,.0f}")
+            if sold:
+                n = sum(1 for a in executed if a["side"] == "sell")
+                parts.append(f"{n} sell{'s' if n > 1 else ''} totalling ${sold:,.0f}")
+            refused = len(actions) - len(executed)
+            if refused:
+                parts.append(f"{refused} that never reached the broker")
+            record["summary"] = (
+                f"You have acted on {symbol} {len(actions)} time"
+                f"{'s' if len(actions) > 1 else ''} "
+                f"({', '.join(parts) if parts else 'none executed'}), "
+                f"between {actions[0]['date']} and {actions[-1]['date']}."
+            )
+            shown = actions[-limit_per_symbol:]
+            if len(shown) < len(actions):
+                record["note"] = (
+                    f"Showing the most recent {len(shown)} of {len(actions)} actions."
+                )
+            record["actions"] = shown
+        if symbol in verdicts:
+            record["review_verdicts_you_have_returned"] = verdicts[symbol]
+        history[symbol] = record
+    return history
+
+
 CASE_FIELDS = ("thesis", "target", "invalidation")
 
 
@@ -1553,7 +1696,8 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         # Must precede both the prompt and validation — they read the result.
         price_pending_orders(portfolio, market.prices)
         theses = fetch_open_theses(conn)
-        prompt = build_decision_prompt(portfolio, market, theses, now)
+        actions = fetch_action_history(conn)
+        prompt = build_decision_prompt(portfolio, market, theses, actions, now)
         trades, reviews, raw_response = get_claude_decision(prompt)
         validated = validate_trades(trades, portfolio, mode)
         execute_trades(validated, mode, markettime.fmt_et_date(now))

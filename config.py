@@ -68,6 +68,13 @@ CLAUDE_EFFORT = "xhigh"
 # the same budget: at xhigh, 8192 is not enough headroom to be safe.
 CLAUDE_MAX_TOKENS = 32000
 
+# How many of this agent's own prior trades in a symbol are replayed back into
+# the prompt. The stored thesis says what it believed; this says what it did.
+# Capped because it grows without bound: the newest actions carry the intent a
+# current decision could contradict, and older ones are already reflected in
+# the position weight the model can see.
+ACTION_HISTORY_LIMIT = 5
+
 # --- Tradable universe (long-only, whitelisted US equities/ETFs) -------------
 WATCHLIST = [
     "A", "AA", "AAL", "AAMI", "AAON", "AAP", "AAPL", "AAT", "ABBV", "ABCB",

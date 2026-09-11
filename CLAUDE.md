@@ -23,7 +23,7 @@ rejected by code-enforced guardrails, never by a human in the loop.
 
 | File | Role |
 |---|---|
-| `agent.py` | The whole pipeline: gather → decide → validate → execute → log, plus the SQLite schema, the thesis lifecycle, and the system prompt. The only module that writes anything. |
+| `agent.py` | The whole pipeline: gather → decide → validate → execute → log, plus the SQLite schema, the thesis lifecycle, the self-history injection (`fetch_action_history`), and the system prompt. The only module that writes anything. |
 | `config.py` | Guardrail thresholds, `CLAUDE_MODEL` / `CLAUDE_MAX_TOKENS`, `VALID_EXIT_TRIGGERS`, and `WATCHLIST` (S&P 500 ∪ Nasdaq-100, snapshotted 2026-07-21 — index membership drifts, refresh occasionally). |
 | `markettime.py` | Store UTC, display Eastern. Every display boundary — console, dashboard, report, *and the prompt Claude reads* — converts through here. Do not format timestamps ad hoc elsewhere. |
 | `dashboard.py` | Reads Alpaca + the DB, writes a self-contained `dashboard.html` (agent equity curve vs. buy-and-hold SPY, holdings, risk stats, decision log). No server, no external requests at view time. |
@@ -123,6 +123,49 @@ This is the core behavioral design and has no README coverage.
 - `apply_thesis_lifecycle` now runs **after** `log_decision_cycle` (it takes the
   `cycle_id`, so revisions name the cycle that made them). The audit record of
   what was decided is written before any state derived from it.
+
+## What the model can see of its own past
+
+Each cycle is a **stateless single-turn call** — `messages=[{"role": "user", ...}]`,
+no conversation history. Everything the model knows about its own past has to be
+put in the prompt deliberately. Two things are:
+
+- **The case** (`fetch_open_theses`) — what it *believed*, injected per position.
+- **The record** (`fetch_action_history`) — what it *did*, injected per position
+  as `your_track_record`: every prior trade in that name with the reasoning
+  given at the time, a one-line summary counting all of them, and a tally of
+  review verdicts returned. Capped at `config.ACTION_HISTORY_LIMIT` (5) actions
+  per symbol; the summary still counts them all, so truncation loses detail but
+  never the fact that earlier actions happened.
+
+The record exists because position weight is a lossy encoding of history, and
+re-deriving intent from it produces two specific failures, both observed:
+
+- **Re-deciding.** MSFT was trimmed six times (cycles 7, 8, 9, 11, 25, 27), each
+  trim restating the previous one's reasoning about the same passed `$420+`
+  marker. Nothing carried "you already acted on this" forward, so a spent
+  observation read as news every cycle. It stopped after the case was
+  re-anchored at cycle 29 — three clean cycles, which is consistent with the fix
+  but not yet proof of it.
+- **Drifting past its own stated intent.** Cycle 29 wrote "I will size the
+  position up toward ~6-7% next cycle"; cycles 31 and 32 executed that plan
+  without being able to read it, reconstructing it from weight and days held,
+  and cycle 32 took GD to 7.4%. No guardrail covers this — a self-imposed
+  ceiling is not a code invariant, so only the model can enforce it, and only if
+  it can see it.
+
+Rejected and unexecuted proposals are included and labelled, so an intention is
+never read back as a fill. Slow tranching is the agent's dominant mode (of 25
+trades in 32 cycles, ~12 are follow-on tranches in a name it had already
+traded), and it is legitimate — the record is there so it happens on purpose.
+
+Costs ~4k tokens on a ~13k-token prompt (+33%). Most of that is the reasoning
+text, not the number of actions, so lowering the cap barely helps: limit 3 vs 10
+differs by ~700 tokens.
+
+**Still not injected:** past cycles' full commentary (`decision_cycles`), review
+*notes* (only the verdict tally is — the notes are ~6.5k tokens for five cycles),
+and superseded thesis wordings.
 
 ## Guardrails (code-enforced invariants, not advisory)
 
