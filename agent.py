@@ -12,6 +12,7 @@ Pipeline (see README.md#architecture):
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import math
 import os
@@ -95,17 +96,36 @@ class PortfolioState:
 
 
 @dataclass
+class NewsArticle:
+    """One Alpaca news item, as archived in `news_articles`.
+
+    `id` is Alpaca's own article id, which is what makes the archive
+    idempotent: the same story fetched on ten consecutive days is one row.
+    """
+    id: int
+    headline: str
+    summary: str
+    source: str
+    url: str
+    published_at: str   # UTC ISO
+    symbols: list[str]
+
+
+@dataclass
 class MarketContext:
     """Fresh prices and news for current holdings + watchlist, injected into the prompt.
 
-    `news` is per-held-symbol and complete: every open position gets its own
-    lookup, so an empty list means "no recent news", not "we didn't look".
+    `articles` is everything fetched this cycle, for the archive. Each held
+    position gets its own lookup, so once archived its news is complete for the
+    window — an empty result means "no recent news", not "we didn't look" —
+    except for the symbols in `news_lookup_failed`, where it means exactly that.
     `market_news` is a broad sample across the watchlist — it cannot be complete
     at watchlist scale and must not be read as per-symbol coverage.
     """
     prices: dict[str, float]
-    news: dict[str, list[str]]
-    market_news: list[str]
+    articles: list[NewsArticle]
+    news_lookup_failed: set[str]
+    market_news: list[NewsArticle]
     watchlist: list[str]
     # Per-symbol screen statistics (momentum, 52-week range position, realised
     # volatility, liquidity) for every watchlist name that had enough history.
@@ -348,8 +368,8 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
     symbols = sorted(set(watchlist) | set(portfolio.positions.keys()))
     if not symbols:
         return MarketContext(
-            prices={}, news={}, market_news=[], watchlist=watchlist,
-            screen={}, candidates=[],
+            prices={}, articles=[], news_lookup_failed=set(), market_news=[],
+            watchlist=watchlist, screen={}, candidates=[],
         )
 
     data_client = _data_client()
@@ -366,19 +386,36 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
     # 520-name watchlist, and it degrades as the universe grows. The agent has
     # to review every open thesis against today's news, so that coverage cannot
     # be left to chance; positions are few, so the extra calls are cheap.
-    news: dict[str, list[str]] = {}
+    articles: list[NewsArticle] = []
+    news_lookup_failed: set[str] = set()
+    window_start = markettime.now_utc() - timedelta(days=config.NEWS_HISTORY_DAYS)
     for symbol in sorted(portfolio.positions):
-        news[symbol] = _headlines(
-            news_client, NewsRequest(symbols=symbol, limit=config.NEWS_HEADLINES_PER_SYMBOL)
+        fetched = _fetch_articles(
+            news_client,
+            NewsRequest(
+                symbols=_news_symbol(symbol), start=window_start,
+                limit=config.NEWS_FETCH_PER_SYMBOL,
+            ),
         )
+        if fetched is None:
+            news_lookup_failed.add(symbol)
+            continue
+        # Filed under the holding's own ticker as well as whatever the feed
+        # tagged: the request was for this symbol, and the feed's spelling of
+        # it (BRK/B, BRK) is not the one the rest of the agent uses.
+        for a in fetched:
+            if symbol not in a.symbols:
+                a.symbols.append(symbol)
+        articles.extend(fetched)
 
     # Broad sweep over the tradable universe for opportunities the agent doesn't
     # already own. Deliberately not per-symbol: at watchlist scale that is not
     # achievable in one cycle, so this is labelled a sample in the prompt.
-    market_news = _headlines(
+    market_news = _fetch_articles(
         news_client,
         NewsRequest(symbols=",".join(watchlist), limit=config.MARKET_NEWS_ARTICLES),
-    )
+    ) or []
+    articles.extend(market_news)
 
     # Screen statistics come from daily bars, not the latest trade: `prices`
     # above stays the freshest available mark because it sizes orders, while the
@@ -386,9 +423,31 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
     screen = compute_screen_stats(symbols)
     candidates = select_candidates(screen, portfolio.positions.keys())
 
+    # Candidates get their own lookup too, smaller than a holding's. A buy has
+    # to open a written case, and without this the only current information
+    # behind a case for a name the agent does not own was the price table. The
+    # fetch still covers the whole window, so a name that sits on the shortlist
+    # for days — or is bought — already has history in the archive.
+    for symbol in candidates:
+        fetched = _fetch_articles(
+            news_client,
+            NewsRequest(
+                symbols=_news_symbol(symbol), start=window_start,
+                limit=config.NEWS_FETCH_PER_CANDIDATE,
+            ),
+        )
+        if fetched is None:
+            news_lookup_failed.add(symbol)
+            continue
+        for a in fetched:
+            if symbol not in a.symbols:
+                a.symbols.append(symbol)
+        articles.extend(fetched)
+
     return MarketContext(
         prices=prices,
-        news=news,
+        articles=articles,
+        news_lookup_failed=news_lookup_failed,
         market_news=market_news,
         watchlist=watchlist,
         screen=screen,
@@ -518,24 +577,46 @@ def select_candidates(
     return list(seen)
 
 
-def _headlines(news_client, request) -> list[str]:
-    """Headlines for one news request, de-duplicated, newest first.
+def _news_symbol(symbol: str) -> str:
+    """The ticker to query the news feed with for a broker symbol.
+
+    Share-class tickers are spelled differently by the feed: the broker's
+    BRK.B is tagged BRK, BRK/A or BRK/B, and a query for "BRK.B" matches
+    nothing — which the prompt then presented as a complete lookup that found
+    no news, for every one of BRK.B's first 40 reviews. The base ticker catches
+    all of the company's classes, which for news is the right scope anyway.
+    """
+    return symbol.split(".", 1)[0]
+
+
+def _fetch_articles(news_client, request) -> list[NewsArticle] | None:
+    """Articles for one news request, newest first, or None if the lookup failed.
 
     News is context, not a guardrail input — a failed lookup degrades the
-    prompt but must not abort a cycle that can still trade on prices.
+    prompt but must not abort a cycle that can still trade on prices. None and
+    an empty list are kept distinct because they mean different things to the
+    model: "we could not look" versus "we looked and there was nothing".
     """
     try:
         news_set = news_client.get_news(request)
     except Exception:
-        return []
+        return None
 
-    articles = news_set.data.get("news", []) if hasattr(news_set, "data") else news_set
-    seen: dict[str, None] = {}
-    for article in articles:
-        headline = getattr(article, "headline", None)
-        if headline:
-            seen.setdefault(headline, None)
-    return list(seen)
+    raw = news_set.data.get("news", []) if hasattr(news_set, "data") else news_set
+    articles = []
+    for a in raw:
+        if not getattr(a, "headline", None) or getattr(a, "created_at", None) is None:
+            continue
+        articles.append(NewsArticle(
+            id=int(a.id),
+            headline=a.headline,
+            summary=a.summary or "",
+            source=a.source or "",
+            url=a.url or "",
+            published_at=a.created_at.astimezone(timezone.utc).isoformat(),
+            symbols=list(a.symbols or []),
+        ))
+    return articles
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +734,12 @@ that name, with the reasoning you gave at the time, and a tally of the review \
 verdicts you have returned on it. This is your record, not market data. Rejected and \
 unexecuted proposals appear too, labelled — an intention you had is not a fill you got.
 
+A candidate you have owned or traded before carries its record as well, including \
+"last_closed_case": the case you held it on, when you closed it, and the exit \
+trigger you gave. Buying back a name you exited is allowed, but it is a reversal of \
+your own decision, so say what has changed since the exit — the same test as any \
+other repeat action.
+
 Read it before acting on a name you have acted on before. It exists because of two \
 failures that are invisible from position weight alone:
 
@@ -676,7 +763,22 @@ WHAT THE NEWS FIELDS MEAN
 
 "position_news" is complete: every open position was looked up individually, so an \
 empty list there means no recent headlines were found for that holding — that is real \
-information, not a gap.
+information, not a gap. The one exception is a holding marked "lookup_failed", where \
+today's lookup did not happen and silence means nothing.
+
+It is read from an archive of every article you have been given, covering a rolling \
+window of recent weeks, and split in two:
+- "published_since_your_last_cycle" — you have never seen these. This is the news.
+- "earlier" — dated headlines published before your previous cycle. The market has \
+  had at least a session to price them, and most you will have been shown before. \
+  They are here so you can recognise a story you have already weighed, and so you \
+  can see how a situation has developed. A story in "earlier" is not by itself a new \
+  reason to act; if you already acted on it, it is spent, exactly like an \
+  observation in your track record.
+
+A development is often only visible across days — three downgrades in two weeks, a \
+guidance cut followed by a CFO departure. Read the two lists together when judging \
+whether a case is weakening.
 
 "market_news_sample" is a small sample across a watchlist of hundreds of tickers. It \
 cannot cover them all. A ticker missing from it tells you nothing about that ticker, so \
@@ -700,6 +802,12 @@ uptrends with short-term pullbacks; the deepest drawdowns from 52-week highs; an
 the best return per unit of volatility. The last bucket is there because you are \
 judged risk-adjusted: the highest-return name is usually not the best position, and \
 a screen that only surfaced big movers would push the book the wrong way.
+
+Each candidate also carries "recent_news": its latest few dated headlines from the \
+last month, from its own lookup. An empty list means that lookup found nothing. It is \
+there so you can see whether something is happening in the business behind the price \
+move — a headline is a lead to weigh, not a case, and three headlines are not \
+coverage of a company.
 
 What this list is NOT: a buy list, a ranking, or a research report. These are price \
 statistics. They tell you what has happened, never why, and momentum is not a thesis \
@@ -811,6 +919,8 @@ def build_decision_prompt(
     market: MarketContext,
     theses: dict[str, Thesis],
     actions: dict[str, dict[str, Any]],
+    news_history: dict[str, dict[str, Any]],
+    candidate_news: dict[str, list[str]],
     as_of: datetime,
 ) -> str:
     """Assemble the prompt sent to Claude, instructing it to return trades as
@@ -949,17 +1059,32 @@ def build_decision_prompt(
         # price with no reference point cannot support a thesis, so the agent
         # could only ever form views on names it already held. This is smaller
         # and answers the question the old field pretended to.
+        #
+        # A candidate this agent has traded before carries its record, closed
+        # case included. Now that exits happen, a name sold last week can come
+        # straight back through the screen, and without this it would arrive
+        # looking like a first encounter.
         "candidates": [
-            {"symbol": s, **market.screen[s]}
+            {
+                "symbol": s,
+                **market.screen[s],
+                **({"recent_news": candidate_news[s]} if s in candidate_news else {}),
+                **({"your_track_record": actions[s]} if s in actions else {}),
+            }
             for s in market.candidates
             if s in market.screen
         ],
         # Kept separate on purpose. position_news is complete — every holding was
         # looked up, so an empty list genuinely means no recent news and is
-        # itself information. market_news is a sample across the watchlist; a
-        # ticker's absence there says nothing about that ticker.
-        "position_news": {s: market.news.get(s, []) for s in portfolio.positions},
-        "market_news_sample": market.market_news,
+        # itself information. It is read from the archive, split at the previous
+        # cycle, so a story already reacted to is labelled as such. market_news
+        # is a sample across the watchlist; a ticker's absence there says
+        # nothing about that ticker.
+        "position_news": {s: news_history.get(s, {}) for s in portfolio.positions},
+        "market_news_sample": [
+            f"{markettime.fmt_et_date(a.published_at)} — {a.headline}"
+            for a in market.market_news
+        ],
     }
 
     return (
@@ -1449,6 +1574,33 @@ def init_db(db_path: str) -> sqlite3.Connection:
         )
         """
     )
+    # Every news article the agent has been shown or could have been, keyed by
+    # Alpaca's article id so a story fetched on ten days is one row. The prompt
+    # reads a holding's news back from here, not from the day's fetch — this is
+    # what lets the model tell a story it already reacted to from a new one.
+    # `first_seen_at` is audit only; "new" is decided by publication time.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS news_articles (
+            id INTEGER PRIMARY KEY,
+            published_at TEXT NOT NULL,
+            headline TEXT NOT NULL,
+            summary TEXT,
+            source TEXT,
+            url TEXT,
+            first_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS news_symbols (
+            article_id INTEGER NOT NULL REFERENCES news_articles(id),
+            symbol TEXT NOT NULL,
+            PRIMARY KEY (symbol, article_id)
+        )
+        """
+    )
     # One open thesis per symbol is an invariant the lifecycle below relies on.
     conn.execute(
         """
@@ -1579,8 +1731,28 @@ def fetch_action_history(
     ):
         verdicts.setdefault(symbol, {})[verdict] = n
 
+    # The most recent case this agent closed in each name, with why. Trades
+    # carry the sell's reasoning but not the case it ended, and once a position
+    # is gone its thesis is never shown again — so without this, a name exited
+    # last week can come back as a candidate looking like a first encounter.
+    closed: dict[str, dict[str, Any]] = {}
+    for symbol, opened_at, closed_at, trigger, thesis, target, invalidation in conn.execute(
+        """
+        SELECT symbol, opened_at, closed_at, exit_trigger, thesis, target, invalidation
+        FROM theses WHERE status = 'closed' ORDER BY closed_at
+        """
+    ):
+        closed[symbol] = {
+            "opened_at": markettime.fmt_et_date(opened_at),
+            "closed_at": markettime.fmt_et_date(closed_at) if closed_at else None,
+            "exit_trigger": trigger,
+            "why_you_owned_it": thesis,
+            "target": target,
+            "invalidation": invalidation,
+        }
+
     history: dict[str, dict[str, Any]] = {}
-    for symbol in set(grouped) | set(verdicts):
+    for symbol in set(grouped) | set(verdicts) | set(closed):
         actions = grouped.get(symbol, [])
         record: dict[str, Any] = {}
         if actions:
@@ -1611,7 +1783,163 @@ def fetch_action_history(
             record["actions"] = shown
         if symbol in verdicts:
             record["review_verdicts_you_have_returned"] = verdicts[symbol]
+        if symbol in closed:
+            record["last_closed_case"] = closed[symbol]
         history[symbol] = record
+    return history
+
+
+def store_news(
+    conn: sqlite3.Connection, articles: list[NewsArticle], now: datetime
+) -> int:
+    """Archive fetched articles; returns how many were not already stored.
+
+    Idempotent on Alpaca's article id. Stored before the decision is made and
+    committed straight away: the archive is a record of what was available,
+    not of what was decided, so a cycle that later fails should still keep it.
+    """
+    before = conn.total_changes
+    for a in articles:
+        conn.execute(
+            """INSERT OR IGNORE INTO news_articles
+               (id, published_at, headline, summary, source, url, first_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (a.id, a.published_at, a.headline, a.summary, a.source, a.url,
+             now.isoformat()),
+        )
+    added = conn.total_changes - before
+    for a in articles:
+        for symbol in a.symbols:
+            conn.execute(
+                "INSERT OR IGNORE INTO news_symbols (article_id, symbol) VALUES (?, ?)",
+                (a.id, symbol),
+            )
+    conn.commit()
+    return added
+
+
+def _spread_by_day(rows: list[tuple], limit: int) -> list[tuple]:
+    """Pick up to `limit` rows covering as many distinct days as possible.
+
+    Rows are newest first. Taking the newest N outright fails for a heavily
+    covered name — AAPL fills eight slots from a single afternoon — and then
+    the "history" is one day long. Instead take the newest article from each
+    day first, newest day first, and only then fill the remaining slots by
+    recency. Output stays newest first.
+    """
+    by_day: dict[str, list[tuple]] = {}
+    for r in rows:
+        by_day.setdefault(markettime.fmt_et_date(r[0]), []).append(r)
+    picked = [articles[0] for articles in by_day.values()][:limit]
+    chosen = set(map(id, picked))
+    picked += [r for r in rows if id(r) not in chosen][: limit - len(picked)]
+    return sorted(picked, key=lambda r: r[0], reverse=True)
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _archived_news(
+    conn: sqlite3.Connection, symbol: str, window_start: str
+) -> list[tuple[str, str, str, str]]:
+    """(published_at, source, headline, summary) for a symbol, newest first."""
+    rows = conn.execute(
+        """SELECT a.published_at, a.source, a.headline, a.summary
+           FROM news_articles a JOIN news_symbols s ON s.article_id = a.id
+           WHERE s.symbol = ? AND a.published_at >= ?
+           ORDER BY a.published_at DESC, a.id DESC""",
+        (symbol, window_start),
+    ).fetchall()
+    # The feed HTML-escapes some headlines ("Storage &amp; Peripherals").
+    return [(ts, src, html.unescape(hl), html.unescape(sm or ""))
+            for ts, src, hl, sm in rows]
+
+
+def fetch_candidate_news(
+    conn: sqlite3.Connection,
+    symbols: Iterable[str],
+    now: datetime,
+    lookup_failed: set[str] = frozenset(),
+) -> dict[str, list[str]]:
+    """The most recent few dated headlines per candidate, from the archive.
+
+    Deliberately thinner than a holding's news: no summaries and no
+    new/earlier split. A candidate needs enough to tell whether something is
+    going on in the business behind the price move — not a running story. A
+    failed lookup is a one-item list saying so, never an empty list, since an
+    empty list here means the lookup found nothing in the window.
+    """
+    window_start = (now - timedelta(days=config.NEWS_HISTORY_DAYS)).isoformat()
+    out: dict[str, list[str]] = {}
+    for symbol in symbols:
+        if symbol in lookup_failed:
+            out[symbol] = ["(news lookup failed today — no information either way)"]
+            continue
+        rows = _archived_news(conn, symbol, window_start)[: config.NEWS_PER_CANDIDATE]
+        out[symbol] = [f"{markettime.fmt_et_date(ts)} — {hl}" for ts, _, hl, _ in rows]
+    return out
+
+
+def fetch_news_history(
+    conn: sqlite3.Connection,
+    symbols: Iterable[str],
+    now: datetime,
+    lookup_failed: set[str] = frozenset(),
+) -> dict[str, dict[str, Any]]:
+    """Each symbol's archived news over the window, split at the previous cycle.
+
+    "New" means published after the last logged decision cycle — i.e. the
+    model has never been shown it. Everything older in the window is listed as
+    headlines it can recognise, so a story it reacted to last week reads as
+    last week's story rather than as today's news. With no previous cycle,
+    everything in the window counts as new.
+    """
+    (last_cycle,) = conn.execute("SELECT MAX(timestamp) FROM decision_cycles").fetchone()
+    window_start = (now - timedelta(days=config.NEWS_HISTORY_DAYS)).isoformat()
+
+    history: dict[str, dict[str, Any]] = {}
+    for symbol in sorted(symbols):
+        rows = _archived_news(conn, symbol, window_start)
+        new = [r for r in rows if last_cycle is None or r[0] > last_cycle]
+        earlier = _spread_by_day(
+            [r for r in rows if not (last_cycle is None or r[0] > last_cycle)],
+            config.NEWS_EARLIER_PER_SYMBOL,
+        )
+
+        entry: dict[str, Any] = {
+            "published_since_your_last_cycle": [
+                {
+                    "published": markettime.fmt_et(ts),
+                    "source": source,
+                    "headline": headline,
+                    **({"summary": _clip(summary, config.NEWS_SUMMARY_CHARS)}
+                       if summary else {}),
+                }
+                for ts, source, headline, summary in new[: config.NEWS_NEW_PER_SYMBOL]
+            ],
+            "earlier": [
+                f"{markettime.fmt_et_date(ts)} — {headline}"
+                for ts, _, headline, _ in earlier
+            ],
+        }
+        hidden_new = len(new) - config.NEWS_NEW_PER_SYMBOL
+        hidden_old = (len(rows) - len(new)) - len(earlier)
+        if hidden_new > 0 or hidden_old > 0:
+            entry["not_shown"] = (
+                f"{max(hidden_new, 0)} newer and {max(hidden_old, 0)} older articles "
+                f"in the last {config.NEWS_HISTORY_DAYS} days were left out for length."
+            )
+        if symbol in lookup_failed:
+            # The archive may still hold older items, but today's fetch did not
+            # happen, so an empty "new" list here is not evidence of quiet.
+            entry["lookup_failed"] = (
+                "Today's news lookup for this symbol failed. Anything published "
+                "since your last cycle may be missing — do not read silence as "
+                "no news."
+            )
+        history[symbol] = entry
     return history
 
 
@@ -1949,9 +2277,18 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         # Needs prices, so it runs here rather than in fetch_portfolio_state.
         # Must precede both the prompt and validation — they read the result.
         price_pending_orders(portfolio, market.prices)
+        news_added = store_news(conn, market.articles, now)
+        news_history = fetch_news_history(
+            conn, portfolio.positions, now, market.news_lookup_failed,
+        )
+        candidate_news = fetch_candidate_news(
+            conn, market.candidates, now, market.news_lookup_failed,
+        )
         theses = fetch_open_theses(conn)
         actions = fetch_action_history(conn)
-        prompt = build_decision_prompt(portfolio, market, theses, actions, now)
+        prompt = build_decision_prompt(
+            portfolio, market, theses, actions, news_history, candidate_news, now,
+        )
         trades, reviews, raw_response, usage = get_claude_decision(prompt)
         validated = validate_trades(trades, portfolio, mode)
         execute_trades(validated, mode, markettime.fmt_et_date(now))
@@ -1969,6 +2306,7 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         prompt_path = write_prompt_log(cycle_id, prompt, mode, now)
         _print_cycle_summary(
             cycle_id, now, validated, reviews, thesis_counts, portfolio, prompt_path,
+            news_added,
         )
     except Exception:
         # Record the failure before the exception propagates and exits non-zero.
@@ -1988,6 +2326,7 @@ def _print_cycle_summary(
     thesis_counts: dict[str, int],
     portfolio: PortfolioState,
     prompt_path: str,
+    news_added: int,
 ) -> None:
     """Five-line cycle summary — this is what lands in the launchd log.
 
@@ -2024,6 +2363,7 @@ def _print_cycle_summary(
     # quiet no-op: it will keep reasoning against wording it thinks it changed.
     if thesis_counts.get("incomplete"):
         print(f"  INCOMPLETE CASE IGNORED {thesis_counts['incomplete']}")
+    print(f"  news archived           {news_added} new article{'s' if news_added != 1 else ''}")
     print(f"  prompt                  {prompt_path}")
 
 

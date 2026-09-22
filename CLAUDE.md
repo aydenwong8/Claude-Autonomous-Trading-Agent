@@ -128,7 +128,7 @@ This is the core behavioral design and has no README coverage.
 
 Each cycle is a **stateless single-turn call** — `messages=[{"role": "user", ...}]`,
 no conversation history. Everything the model knows about its own past has to be
-put in the prompt deliberately. Two things are:
+put in the prompt deliberately. Three things are:
 
 - **The case** (`fetch_open_theses`) — what it *believed*, injected per position.
 - **The record** (`fetch_action_history`) — what it *did*, injected per position
@@ -136,7 +136,35 @@ put in the prompt deliberately. Two things are:
   given at the time, a one-line summary counting all of them, and a tally of
   review verdicts returned. Capped at `config.ACTION_HISTORY_LIMIT` (5) actions
   per symbol; the summary still counts them all, so truncation loses detail but
-  never the fact that earlier actions happened.
+  never the fact that earlier actions happened. Also carries `last_closed_case`
+  (the case it held the name on, when it closed, and the exit trigger), and is
+  attached to **candidates** the agent has traded before, not only to holdings —
+  once exits started happening, a name sold last week could otherwise come back
+  through the screen looking like a first encounter.
+- **The news** (`fetch_news_history`) — what it *was told*. Every article
+  fetched is archived in `news_articles` / `news_symbols` (idempotent on
+  Alpaca's article id), and each holding's `position_news` is read back from the
+  archive over `config.NEWS_HISTORY_DAYS` (30), split at the previous decision
+  cycle: `published_since_your_last_cycle` (with summaries — genuinely new) and
+  `earlier` (dated headlines, spread across distinct days so a heavily covered
+  name doesn't fill every slot from one afternoon). Before this the model got
+  three undated headlines per holding, rebuilt from scratch daily, so it could
+  not tell a story it had already reacted to from one that broke today — the
+  same spent-fact failure as re-deciding, arriving through the news instead of
+  the record. Each holding is fetched over the whole window every cycle, which
+  makes the archive self-healing after a missed day. A failed lookup is flagged
+  `lookup_failed` rather than shown as an empty (i.e. quiet) list. Candidates
+  get a lighter version (`fetch_candidate_news`): their own lookup, archived the
+  same way, but only the newest `config.NEWS_PER_CANDIDATE` (3) dated headlines
+  shown as `recent_news` — without it the only current information behind a
+  case for a name not held was the price table. Measured with `count_tokens` on
+  2026-09-22 against cycle 44: +4.1k tokens for holdings' news, +4.8k for
+  candidates', +0.5k for dating the market sample, +0.5k of system prompt —
+  ~10k in all, about $0.05 a cycle. Share-class tickers are queried by base symbol
+  (`_news_symbol`: `BRK.B` → `BRK`) because the feed tags `BRK` / `BRK/A` /
+  `BRK/B` and never `BRK.B` — until 2026-09-22 every BRK.B lookup returned
+  nothing, and the prompt presented that as a complete lookup finding no news
+  across 40 reviews. Same applies to `BF.B` and `MOG.A`.
 
 The record exists because position weight is a lossy encoding of history, and
 re-deriving intent from it produces two specific failures, both observed:
@@ -165,7 +193,9 @@ differs by ~700 tokens.
 
 **Still not injected:** past cycles' full commentary (`decision_cycles`), review
 *notes* (only the verdict tally is — the notes are ~6.5k tokens for five cycles),
-and superseded thesis wordings.
+and superseded thesis wordings. Names that are neither held nor on today's
+shortlist get no per-symbol news; they appear only if the 40-article market
+sample happens to cover them.
 
 ## Guardrails (code-enforced invariants, not advisory)
 
@@ -285,6 +315,12 @@ Created idempotently by `agent.py:init_db`.
   `theses.revision`, so it is idempotent.
 - `position_reviews` — `cycle_id`, `symbol`, `verdict`, `note`. Case fields
   supplied on a review land in `theses`/`thesis_revisions`, not here.
+- `news_articles` — every news article fetched: `id` (Alpaca's, the primary
+  key), `published_at` (UTC ISO), `headline`, `summary`, `source`, `url`,
+  `first_seen_at` (audit only — "new" is decided by `published_at` against the
+  last cycle's timestamp). `news_symbols` maps `(symbol, article_id)`. Stored and
+  committed before the decision is made: it records what was available, so a
+  cycle that later fails still keeps it.
 - `run_log` — one row per *invocation*, success or failure, with `error_text`
   and `cycles_completed`. Written on the failure path before the exception
   propagates: without it, a scheduled run that died is indistinguishable from a

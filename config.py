@@ -231,10 +231,32 @@ WATCHLIST = [
     "YETI", "YOU", "YUM", "ZBH", "ZBRA", "ZD", "ZION", "ZTS", "ZWS",
 ]
 
-# --- News lookup ---------------------------------------------------------------
-# Headlines fetched per HELD position, one request each, so every open thesis is
-# reviewed against its own news rather than whatever a shared cap happened to cover.
-NEWS_HEADLINES_PER_SYMBOL = 3
+# --- News lookup and archive ---------------------------------------------------
+# Every article fetched is kept in the `news_articles` table, keyed by Alpaca's
+# article id, and each held position's news is read back from that archive
+# rather than from the day's fetch. Three headlines with no dates, rebuilt from
+# scratch daily, meant the agent could not tell a story it had already reacted
+# to from one that broke this afternoon, and nothing older than the last three
+# items existed for it at all.
+#
+# Articles fetched per HELD position, one request each covering the last
+# NEWS_HISTORY_DAYS, so every open thesis is reviewed against its own news
+# rather than whatever a shared cap happened to cover. Fetching the whole window
+# every cycle is also what keeps the archive self-healing: a missed or failed
+# day is backfilled by the next one.
+NEWS_FETCH_PER_SYMBOL = 20
+NEWS_HISTORY_DAYS = 30
+# Shown per holding. Articles published since the previous cycle carry their
+# summary; older ones are headline-only, since the model has seen them before
+# and only needs to recognise them. Summaries are clipped — Benzinga's run long.
+NEWS_NEW_PER_SYMBOL = 5
+NEWS_EARLIER_PER_SYMBOL = 8
+NEWS_SUMMARY_CHARS = 240
+# Candidates (the screened shortlist of names not held) get a lighter lookup:
+# fetched over the same window so the archive fills in, but only the newest few
+# headlines shown. ~30 candidates x 3 headlines is ~6k prompt tokens.
+NEWS_FETCH_PER_CANDIDATE = 10
+NEWS_PER_CANDIDATE = 3
 # Broad market sweep across the watchlist. This is a sample, not per-symbol
 # coverage — at watchlist scale no article budget makes it complete.
 MARKET_NEWS_ARTICLES = 40
