@@ -239,5 +239,31 @@ NEWS_HEADLINES_PER_SYMBOL = 3
 # coverage — at watchlist scale no article budget makes it complete.
 MARKET_NEWS_ARTICLES = 40
 
+# --- Candidate screen -----------------------------------------------------------
+# The prompt used to carry `watchlist_prices`: every watchlist symbol mapped to a
+# bare last price. At 1,519 names that was a third of the whole prompt and it was
+# unusable — a price with no reference point supports no judgment, so the only
+# names the agent could form a view on were the ones it already held, and every
+# trade it ever made was a tranche into an existing position. Worse, "no_longer_fits"
+# is defined as "better use of the capital", which cannot fire without a better
+# candidate to name, so the agent could not raise cash either. It sat at the 5% cash
+# buffer for weeks returning nothing but `hold`.
+#
+# These parameters drive the replacement: a screen over daily bars that produces a
+# small set of candidates carrying enough context to argue about.
+SCREEN_LOOKBACK_DAYS = 400          # calendar days of daily bars (~275 trading days)
+SCREEN_MIN_BARS = 40                # skip symbols too newly listed to measure
+# Alpaca's free tier serves IEX bars, whose volume is only IEX's share of
+# consolidated tape — roughly an order of magnitude below real dollar volume. This
+# threshold is calibrated against that, not against true ADV: at $10M every current
+# holding clears (the smallest, GD, is ~$17M) while ~450 of 1,519 names survive.
+# Raising it to $20M would screen out a position the agent already owns.
+SCREEN_MIN_DOLLAR_VOL_M = 10.0
+# Candidates are drawn from four buckets rather than one ranking. A single
+# momentum sort would hand the agent nothing but high-beta names, which is the
+# wrong bias when the mandate is risk-adjusted return — the low-volatility bucket
+# exists specifically to counterweight that.
+SCREEN_PER_BUCKET = 10
+
 # --- Storage --------------------------------------------------------------------
 DEFAULT_DB_PATH = "trading_agent.db"

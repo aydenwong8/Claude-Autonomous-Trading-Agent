@@ -16,9 +16,11 @@ import json
 import math
 import os
 import sqlite3
+import statistics
 import traceback
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable
 from typing import Any
 
 from dotenv import load_dotenv
@@ -105,6 +107,13 @@ class MarketContext:
     news: dict[str, list[str]]
     market_news: list[str]
     watchlist: list[str]
+    # Per-symbol screen statistics (momentum, 52-week range position, realised
+    # volatility, liquidity) for every watchlist name that had enough history.
+    # Held positions are looked up here too, so a holding and a candidate can be
+    # compared on identical axes — which is what makes a relative verdict possible.
+    screen: dict[str, dict[str, Any]]
+    # The shortlist actually shown to the model, drawn across four buckets.
+    candidates: list[str]
 
 
 @dataclass
@@ -338,7 +347,10 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
 
     symbols = sorted(set(watchlist) | set(portfolio.positions.keys()))
     if not symbols:
-        return MarketContext(prices={}, news={}, market_news=[], watchlist=watchlist)
+        return MarketContext(
+            prices={}, news={}, market_news=[], watchlist=watchlist,
+            screen={}, candidates=[],
+        )
 
     data_client = _data_client()
     latest_trades = data_client.get_stock_latest_trade(
@@ -368,9 +380,142 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
         NewsRequest(symbols=",".join(watchlist), limit=config.MARKET_NEWS_ARTICLES),
     )
 
+    # Screen statistics come from daily bars, not the latest trade: `prices`
+    # above stays the freshest available mark because it sizes orders, while the
+    # screen answers a different question and wants a consistent bar series.
+    screen = compute_screen_stats(symbols)
+    candidates = select_candidates(screen, portfolio.positions.keys())
+
     return MarketContext(
-        prices=prices, news=news, market_news=market_news, watchlist=watchlist
+        prices=prices,
+        news=news,
+        market_news=market_news,
+        watchlist=watchlist,
+        screen=screen,
+        candidates=candidates,
     )
+
+
+def _pct_change(now: float, then: float) -> float | None:
+    """Percent change, or None when the base is unusable."""
+    if not then:
+        return None
+    return round((now / then - 1) * 100, 2)
+
+
+def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]]:
+    """Momentum, range position, realised volatility and liquidity per symbol.
+
+    Computed from daily bars over `config.SCREEN_LOOKBACK_DAYS`. The whole
+    watchlist costs one paginated request (~26s for 1,519 names), so this runs
+    over everything rather than a pre-filtered subset — the filtering happens
+    in `select_candidates`, which needs the full distribution to rank against.
+
+    A failure here degrades the prompt to positions-only; it must not abort a
+    cycle, because the position reviews and the guardrails do not depend on it.
+    """
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import DataFeed
+
+    start = datetime.now(timezone.utc) - timedelta(days=config.SCREEN_LOOKBACK_DAYS)
+    try:
+        bars = _data_client().get_stock_bars(
+            StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=TimeFrame.Day,
+                start=start,
+                # The free tier rejects recent SIP data; IEX is what dashboard.py
+                # uses for its SPY series too, so both curves come off one feed.
+                feed=DataFeed.IEX,
+            )
+        ).data
+    except Exception as exc:
+        print(f"  screen: bar fetch failed ({exc}) — continuing without candidates")
+        return {}
+
+    stats: dict[str, dict[str, Any]] = {}
+    for symbol, series in bars.items():
+        if len(series) < config.SCREEN_MIN_BARS:
+            continue
+        closes = [float(b.close) for b in series]
+        volumes = [float(b.volume) for b in series]
+        last, high, low = closes[-1], max(closes), min(closes)
+
+        # 20-day realised volatility, annualised. Present so the model can weigh
+        # return against the risk taken to get it rather than chasing raw move.
+        window = closes[-21:]
+        rets = [window[i] / window[i - 1] - 1 for i in range(1, len(window))]
+        vol = (
+            round(statistics.stdev(rets) * math.sqrt(252) * 100, 1)
+            if len(rets) > 2 and statistics.stdev(rets)
+            else None
+        )
+        stats[symbol] = {
+            "last": round(last, 2),
+            "chg_5d": _pct_change(last, closes[-6]) if len(closes) > 6 else None,
+            "chg_20d": _pct_change(last, closes[-21]) if len(closes) > 21 else None,
+            "chg_60d": _pct_change(last, closes[-61]) if len(closes) > 61 else None,
+            "pct_52w_range": round((last - low) / (high - low) * 100) if high > low else None,
+            "from_52w_high": _pct_change(last, high),
+            "vol_20d_ann": vol,
+            "dollar_vol_20d_m": round(statistics.median(volumes[-20:]) * last / 1e6, 1),
+        }
+    return stats
+
+
+def select_candidates(
+    stats: dict[str, dict[str, Any]], held: Iterable[str]
+) -> list[str]:
+    """Shortlist names worth arguing about, drawn across four opportunity shapes.
+
+    Deliberately not one ranking. A single momentum sort returns nothing but
+    high-beta names, which biases the book exactly the wrong way when the mandate
+    is risk-adjusted return; the low-volatility bucket is the counterweight, and
+    the drawdown and pullback buckets keep beaten-down names in view at all.
+
+    Held symbols are excluded — they already appear in `positions` with their own
+    case, track record and news, and listing them twice would double-count them.
+    """
+    held = set(held)
+    liquid = {
+        s: v
+        for s, v in stats.items()
+        if s not in held
+        and (v["dollar_vol_20d_m"] or 0) >= config.SCREEN_MIN_DOLLAR_VOL_M
+        and v["chg_60d"] is not None
+    }
+
+    def top(key, reverse=True, where=None):
+        pool = {
+            s: v for s, v in liquid.items()
+            if v[key] is not None and (where is None or where(v))
+        }
+        ranked = sorted(pool, key=lambda s: pool[s][key], reverse=reverse)
+        return ranked[: config.SCREEN_PER_BUCKET]
+
+    buckets = [
+        # Working, and the market agrees.
+        top("chg_60d"),
+        # Uptrend intact, short-term weakness — the same name at a better price.
+        top("chg_60d", where=lambda v: v["chg_60d"] > 10 and (v["chg_5d"] or 0) < -3),
+        # Furthest below its own 52-week high: broken, or mispriced.
+        top("from_52w_high", reverse=False),
+        # Return per unit of volatility — the shape that actually serves Sharpe.
+        sorted(
+            (s for s, v in liquid.items() if v["vol_20d_ann"] and v["chg_60d"] > 5),
+            key=lambda s: liquid[s]["chg_60d"] / liquid[s]["vol_20d_ann"],
+            reverse=True,
+        )[: config.SCREEN_PER_BUCKET],
+    ]
+
+    # Order-preserving dedupe: a name qualifying in two buckets is listed once,
+    # and the shortlist stays stable enough to diff across cycles.
+    seen: dict[str, None] = {}
+    for bucket in buckets:
+        for symbol in bucket:
+            seen.setdefault(symbol, None)
+    return list(seen)
 
 
 def _headlines(news_client, request) -> list[str]:
@@ -405,9 +550,14 @@ still reason carefully, but do not assume your proposals will be accepted verbat
 YOUR MANDATE
 
 You are a thesis-driven swing investor, not a daily trader. You run once per day \
-after the close, but acting every day is not the goal and is usually a mistake. \
-Most days the correct output is zero trades. You are being measured on the quality \
-of your positions over weeks and months, not on activity.
+after the close, and you are measured on the quality of your positions over weeks \
+and months, not on activity. Churn is a cost and a tell.
+
+But inaction is a decision with exactly the same standing as a trade, and it is the \
+one you are most likely to get wrong by default. Holding everything is not the \
+neutral option — it is a choice to leave every dollar precisely where it is, and it \
+has to be as defensible as a trade would be. "Nothing broke today" is not a reason; \
+see DAILY REVIEW for what is.
 
 When you buy, you are opening an investment case. You must write down that case: \
 why you own it, what would count as it playing out, and what would prove you wrong. \
@@ -441,12 +591,36 @@ theme as real risk even when every individual weight is inside the cap.
 DAILY REVIEW
 
 You must return a review verdict for EVERY open position, every cycle, even when you \
-propose no trades. This is the core of the job: re-read each stored thesis against \
-today's price and news, and state whether it still holds.
-- "hold" — case intact, no action
-- "trim" — case intact but position should be smaller (pair with a partial sell)
-- "exit" — case is done or broken (pair with a sell for the full position value)
+propose no trades. This is the core of the job.
+
+Every review answers TWO questions, and a position must pass BOTH to be held:
+
+1. ABSOLUTE — is the written case still true? Re-read the stored thesis against \
+   today's price and news.
+2. RELATIVE — is this still the best use of this capital, judged against the names \
+   in "candidates" and against your other holdings?
+
+The second question is the one that does the real work, and it is the one that is \
+easy to skip. A case can remain technically intact for months while the capital \
+inside it quietly earns less than an alternative you were shown today. An intact \
+case is not by itself a reason to keep owning something — it only means the reason \
+you bought it has not been falsified. Those are different claims.
+
+So: rank your holdings. If the weakest one is clearly worse risk-adjusted than a \
+candidate you can write a real case for, the honest verdict on that holding is \
+"trim" or "exit" with the "no_longer_fits" trigger, even though nothing about it \
+broke. That trigger exists for exactly this and it does not require anything to have \
+gone wrong. A book where every position passes the absolute test and none is ever \
+tested against an alternative is not a managed portfolio; it is a frozen one.
+- "hold" — passes both tests
+- "trim" — position should be smaller (pair with a partial sell)
+- "exit" — case done, broken, or beaten by a better use of the money (pair with a \
+  sell for the full position value)
 A "trim" or "exit" verdict must have a matching sell in "trades", or it is ignored.
+
+None of this overrides the spent-fact discipline in YOUR OWN TRACK RECORD. Rotating \
+into a better idea is a new decision; trimming the same name a seventh time against \
+the same observation is not, and "I needed cash" does not convert one into the other.
 
 RE-ANCHORING A CASE
 
@@ -511,6 +685,33 @@ reason to act or not act. Use it only as a prompt for what to look at.
 
 You are not being given full-market news coverage. Where a decision would turn on \
 information you were not given, say so in your reasoning rather than inferring it.
+
+WHAT "candidates" IS
+
+A shortlist of names you do not currently own, screened from the tradable universe \
+and carrying the same statistics attached to each of your holdings under "screen" — \
+so a candidate and a position can be compared on identical axes. Fields: "chg_5d" / \
+"chg_20d" / "chg_60d" (percent), "pct_52w_range" (0 = at the 52-week low, 100 = at \
+the high), "from_52w_high" (percent below it), "vol_20d_ann" (annualised realised \
+volatility) and "dollar_vol_20d_m" (liquidity).
+
+It is drawn across four deliberately different shapes — strong 60-day momentum; \
+uptrends with short-term pullbacks; the deepest drawdowns from 52-week highs; and \
+the best return per unit of volatility. The last bucket is there because you are \
+judged risk-adjusted: the highest-return name is usually not the best position, and \
+a screen that only surfaced big movers would push the book the wrong way.
+
+What this list is NOT: a buy list, a ranking, or a research report. These are price \
+statistics. They tell you what has happened, never why, and momentum is not a thesis \
+— a name near its 52-week low is either broken or mispriced and nothing here tells \
+you which. Use it as a place to look, then write a real case from what you actually \
+know about the business, or pass on it. Proposing a buy whose entire justification \
+is a number in this table is exactly the failure this field creates the opportunity \
+for, and "it is up 40% in 60 days" is not a case you would defend in three months.
+
+Nothing obliges you to act on it. An empty-handed cycle where you looked and found \
+nothing worth owning is a fine outcome and you should say so. A cycle where you did \
+not look is not.
 
 Guardrails your proposals will be checked against:
 - Max position size: 15% of portfolio equity per ticker (post-trade)
@@ -641,6 +842,11 @@ def build_decision_prompt(
             ),
             "pct_of_equity": round(p.market_value / portfolio.equity * 100, 2) if portfolio.equity else 0,
         }
+        # The same fields every candidate carries. Without this a holding and a
+        # candidate cannot be compared on like terms, and "is this still the best
+        # use of the capital?" has no basis to be answered on.
+        if p.symbol in market.screen:
+            row["screen"] = market.screen[p.symbol]
         t = theses.get(p.symbol)
         if t:
             opened = datetime.fromisoformat(t.opened_at)
@@ -738,7 +944,16 @@ def build_decision_prompt(
         "orders_in_flight": orders_in_flight,
         "cases_not_yet_held": cases_not_yet_held,
         "positions": positions_summary,
-        "watchlist_prices": {s: market.prices.get(s) for s in market.watchlist},
+        # Replaces the old `watchlist_prices` dump. That was 1,519 symbols mapped
+        # to a bare last price — a third of the prompt, and information-free: a
+        # price with no reference point cannot support a thesis, so the agent
+        # could only ever form views on names it already held. This is smaller
+        # and answers the question the old field pretended to.
+        "candidates": [
+            {"symbol": s, **market.screen[s]}
+            for s in market.candidates
+            if s in market.screen
+        ],
         # Kept separate on purpose. position_news is complete — every holding was
         # looked up, so an empty list genuinely means no recent news and is
         # itself information. market_news is a sample across the watchlist; a
@@ -751,13 +966,16 @@ def build_decision_prompt(
         "Current portfolio and market state (JSON):\n"
         f"{json.dumps(state, indent=2)}\n\n"
         "Review every open position against its stored thesis and return a verdict "
-        "for each, re-anchoring any case whose written marker has expired. Then "
-        "decide on trades for this cycle — including none, if none are warranted. "
-        "Buys are limited to uncommitted_cash; if the capital you want is inside a "
-        "position you rate lower, start the rotation rather than recording another "
-        "day of having no room. Before proposing a trade in a name you have traded "
-        "before, read your own track record for it and say what has changed since "
-        "that action — or do not act."
+        "for each, re-anchoring any case whose written marker has expired. Judge each "
+        "one on both tests: is the case still true, and is this still the best use of "
+        "the capital against today's candidates. Rank your holdings weakest to "
+        "strongest in your commentary and say what the weakest one would have to do "
+        "to keep its place. Then decide on trades — including none, if none are "
+        "warranted. Buys are limited to uncommitted_cash; when that is near zero, the "
+        "question is not whether you have room but which position is least worth its "
+        "money, and starting that rotation is the action. Before proposing a trade in "
+        "a name you have traded before, read your own track record for it and say what "
+        "has changed since that action — or do not act."
     )
 
 
@@ -813,7 +1031,7 @@ def _parse_trades_response(
 
 def get_claude_decision(
     prompt: str,
-) -> tuple[list[ProposedTrade], list[PositionReview], str]:
+) -> tuple[list[ProposedTrade], list[PositionReview], str, tuple[int | None, int | None]]:
     """Call the Anthropic API (/v1/messages) and parse the structured JSON
     trade proposals and position reviews from the response.
 
@@ -845,7 +1063,14 @@ def get_claude_decision(
             f"config.CLAUDE_EFFORT (currently {config.CLAUDE_EFFORT}; thinking "
             "tokens count against the same cap). No trades placed."
         )
-    return _parse_trades_response(raw_text)
+    # Recorded so cost stops being an estimate. output_tokens includes thinking,
+    # which is billed but never lands in raw_text.
+    usage = (
+        getattr(response.usage, "input_tokens", None),
+        getattr(response.usage, "output_tokens", None),
+    )
+    trades, reviews, text = _parse_trades_response(raw_text)
+    return trades, reviews, text, usage
 
 
 # ---------------------------------------------------------------------------
@@ -1140,7 +1365,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
             prompt TEXT NOT NULL,
             claude_response TEXT NOT NULL,
             portfolio_cash REAL NOT NULL,
-            portfolio_equity REAL NOT NULL
+            portfolio_equity REAL NOT NULL,
+            input_tokens INTEGER,
+            output_tokens INTEGER
         )
         """
     )
@@ -1230,8 +1457,23 @@ def init_db(db_path: str) -> sqlite3.Connection:
         """
     )
     _migrate_thesis_revisions(conn)
+    _migrate_cycle_usage(conn)
     conn.commit()
     return conn
+
+
+def _migrate_cycle_usage(conn: sqlite3.Connection) -> None:
+    """Add token-usage columns to a pre-usage `decision_cycles` table.
+
+    Left NULL for cycles that ran before usage was recorded — those costs are
+    not recoverable, and a zero would read as "this cycle was free" rather than
+    "we were not counting yet".
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(decision_cycles)")}
+    if "input_tokens" in columns:
+        return
+    conn.execute("ALTER TABLE decision_cycles ADD COLUMN input_tokens INTEGER")
+    conn.execute("ALTER TABLE decision_cycles ADD COLUMN output_tokens INTEGER")
 
 
 def _migrate_thesis_revisions(conn: sqlite3.Connection) -> None:
@@ -1603,18 +1845,30 @@ def log_decision_cycle(
     portfolio: PortfolioState,
     timestamp: datetime,
     mode: str,
+    usage: tuple[int | None, int | None] = (None, None),
 ) -> int:
     """Persist the full prompt, Claude's response/reasoning, validation results,
     executed orders, and portfolio value for this cycle.
+
+    `usage` is (input_tokens, output_tokens) as reported by the API. Output
+    includes thinking tokens, which are billed but never appear in
+    `claude_response` — without recording them here the cycle's real cost can
+    only be guessed at, and effort tuning has nothing to measure against.
 
     Returns the new cycle id, which names this cycle's prompt log file.
     """
     cursor = conn.execute(
         """
-        INSERT INTO decision_cycles (timestamp, mode, prompt, claude_response, portfolio_cash, portfolio_equity)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO decision_cycles (
+            timestamp, mode, prompt, claude_response, portfolio_cash,
+            portfolio_equity, input_tokens, output_tokens
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (timestamp.isoformat(), mode, prompt, claude_response, portfolio.cash, portfolio.equity),
+        (
+            timestamp.isoformat(), mode, prompt, claude_response,
+            portfolio.cash, portfolio.equity, usage[0], usage[1],
+        ),
     )
     cycle_id = cursor.lastrowid
 
@@ -1698,7 +1952,7 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         theses = fetch_open_theses(conn)
         actions = fetch_action_history(conn)
         prompt = build_decision_prompt(portfolio, market, theses, actions, now)
-        trades, reviews, raw_response = get_claude_decision(prompt)
+        trades, reviews, raw_response, usage = get_claude_decision(prompt)
         validated = validate_trades(trades, portfolio, mode)
         execute_trades(validated, mode, markettime.fmt_et_date(now))
         # Logged before the lifecycle runs so the audit record of what was
@@ -1706,6 +1960,7 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         # name the cycle that made them.
         cycle_id = log_decision_cycle(
             conn, prompt, raw_response, validated, reviews, portfolio, now, mode,
+            usage,
         )
         thesis_counts = apply_thesis_lifecycle(
             conn, validated, reviews, portfolio, now, cycle_id,
