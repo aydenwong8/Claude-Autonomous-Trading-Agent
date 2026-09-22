@@ -24,7 +24,7 @@ rejected by code-enforced guardrails, never by a human in the loop.
 | File | Role |
 |---|---|
 | `agent.py` | The whole pipeline: gather → decide → validate → execute → log, plus the SQLite schema, the thesis lifecycle, the self-history injection (`fetch_action_history`), and the system prompt. The only module that writes anything. |
-| `config.py` | Guardrail thresholds, `CLAUDE_MODEL` / `CLAUDE_MAX_TOKENS`, `VALID_EXIT_TRIGGERS`, and `WATCHLIST` (S&P 500 ∪ Nasdaq-100, snapshotted 2026-07-21 — index membership drifts, refresh occasionally). |
+| `config.py` | Guardrail thresholds, `CLAUDE_MODEL` / `CLAUDE_MAX_TOKENS`, `VALID_EXIT_TRIGGERS`, and `WATCHLIST` (S&P 1500 ∪ Nasdaq-100 plus SPY/QQQ, ~1,500 symbols, snapshotted 2026-08-05 — index membership drifts, refresh occasionally). |
 | `markettime.py` | Store UTC, display Eastern. Every display boundary — console, dashboard, report, *and the prompt Claude reads* — converts through here. Do not format timestamps ad hoc elsewhere. |
 | `dashboard.py` | Reads Alpaca + the DB, writes a self-contained `dashboard.html` (agent equity curve vs. buy-and-hold SPY, holdings, risk stats, decision log). No server, no external requests at view time. |
 | `metrics.py` | Pure functions over the DB for the README's evaluation metrics the equity curve alone can't give: annualized return, turnover (SEC N-1A `min(buys, sells)` plus a two-way variant), rejection stats, decision consistency. Imported by `dashboard.py`; covered by `test_metrics.py` (the only tests in the repo). |
@@ -324,4 +324,3 @@ rows; only `report.py` is safe to run casually.
   `python-dotenv`; prices, SPY closes, and news all come from Alpaca.
 - Scheduling is launchd, not cron or GitHub Actions.
 - Phase 3 ("performance dashboard vs. SPY") is already built — `dashboard.py`.
-- Universe is S&P 500 ∪ Nasdaq-100, not "S&P 1500".
