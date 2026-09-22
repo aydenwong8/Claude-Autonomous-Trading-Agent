@@ -297,7 +297,16 @@ Created idempotently by `agent.py:init_db`.
 
 - `decision_cycles` — one row per successful cycle: `timestamp` (UTC ISO),
   `mode`, full `prompt`, raw `claude_response`, `portfolio_cash`,
-  `portfolio_equity`.
+  `portfolio_equity`, `input_tokens` / `output_tokens`, and the agent version
+  that made the decision: `code_commit`, `code_dirty` (uncommitted edits to
+  tracked `.py` files — `dashboard.html` is excluded, it is regenerated every
+  run), `system_prompt_sha`, `model`, `effort`. Captured at the start of the
+  cycle by `current_agent_version`. NULL for cycles before 2026-09-23 and
+  deliberately not backfilled — cycle 43 ran uncommitted code, so a commit
+  inferred from timestamps would be a guess. **Compare performance by version,
+  not across the whole history**: the instructions changed a dozen times in
+  the first two months. Keep scheduled runs on a clean tree, or `code_dirty`
+  makes the commit meaningless.
 - `trades` — every *proposed* trade, valid or not: `cycle_id`, `symbol`, `side`,
   `notional_usd`, `reasoning`, `is_valid`, `rejection_reason`, `order_id`,
   `order_status`. Rejections are kept deliberately; they are decisions.

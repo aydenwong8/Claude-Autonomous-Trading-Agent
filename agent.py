@@ -15,9 +15,11 @@ import argparse
 import html
 import json
 import math
+import hashlib
 import os
 import sqlite3
 import statistics
+import subprocess
 import traceback
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -1492,7 +1494,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
             portfolio_cash REAL NOT NULL,
             portfolio_equity REAL NOT NULL,
             input_tokens INTEGER,
-            output_tokens INTEGER
+            output_tokens INTEGER,
+            code_commit TEXT,
+            code_dirty INTEGER,
+            system_prompt_sha TEXT,
+            model TEXT,
+            effort TEXT
         )
         """
     )
@@ -1610,6 +1617,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
     )
     _migrate_thesis_revisions(conn)
     _migrate_cycle_usage(conn)
+    _migrate_cycle_version(conn)
     conn.commit()
     return conn
 
@@ -1626,6 +1634,72 @@ def _migrate_cycle_usage(conn: sqlite3.Connection) -> None:
         return
     conn.execute("ALTER TABLE decision_cycles ADD COLUMN input_tokens INTEGER")
     conn.execute("ALTER TABLE decision_cycles ADD COLUMN output_tokens INTEGER")
+
+
+def _migrate_cycle_version(conn: sqlite3.Connection) -> None:
+    """Add agent-version columns to a pre-versioning `decision_cycles` table.
+
+    Left NULL for earlier cycles rather than backfilled from git history: a
+    cycle's timestamp says which commit was checked out only if the tree was
+    clean, and it was not always — cycle 43 ran on the candidate screen before
+    that code was committed. A guessed version is worse than an honest gap.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(decision_cycles)")}
+    for name, kind in (
+        ("code_commit", "TEXT"),
+        ("code_dirty", "INTEGER"),
+        ("system_prompt_sha", "TEXT"),
+        ("model", "TEXT"),
+        ("effort", "TEXT"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE decision_cycles ADD COLUMN {name} {kind}")
+
+
+@dataclass(frozen=True)
+class AgentVersion:
+    """Which agent made a decision — recorded on every cycle.
+
+    The instructions change often, and performance can only be attributed to a
+    version if each decision says which version made it. `code_commit` covers
+    everything in the repo (prompt builder, guardrails, config); the prompt
+    hash lets cycles be grouped across commits that left the system prompt
+    alone; model and effort are recorded because config.py can change them
+    without anything else moving.
+    """
+    code_commit: str | None
+    # Uncommitted edits to tracked .py files: the commit alone does not
+    # describe the code that ran. dashboard.html is regenerated every run and
+    # is not code, so it is deliberately not counted.
+    code_dirty: bool | None
+    system_prompt_sha: str
+    model: str
+    effort: str
+
+
+def current_agent_version() -> AgentVersion:
+    """Best-effort: a missing git binary or repo yields None, never a failure."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+
+    def git(*args: str) -> str | None:
+        try:
+            out = subprocess.run(
+                ["git", "-C", repo, *args],
+                capture_output=True, text=True, timeout=10, check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip()
+
+    commit = git("rev-parse", "--short=12", "HEAD")
+    status = git("status", "--porcelain", "--untracked-files=no", "--", "*.py")
+    return AgentVersion(
+        code_commit=commit,
+        code_dirty=None if status is None else bool(status),
+        system_prompt_sha=hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()[:12],
+        model=config.CLAUDE_MODEL,
+        effort=config.CLAUDE_EFFORT,
+    )
 
 
 def _migrate_thesis_revisions(conn: sqlite3.Connection) -> None:
@@ -2174,6 +2248,7 @@ def log_decision_cycle(
     timestamp: datetime,
     mode: str,
     usage: tuple[int | None, int | None] = (None, None),
+    version: AgentVersion | None = None,
 ) -> int:
     """Persist the full prompt, Claude's response/reasoning, validation results,
     executed orders, and portfolio value for this cycle.
@@ -2189,13 +2264,20 @@ def log_decision_cycle(
         """
         INSERT INTO decision_cycles (
             timestamp, mode, prompt, claude_response, portfolio_cash,
-            portfolio_equity, input_tokens, output_tokens
+            portfolio_equity, input_tokens, output_tokens,
+            code_commit, code_dirty, system_prompt_sha, model, effort
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             timestamp.isoformat(), mode, prompt, claude_response,
             portfolio.cash, portfolio.equity, usage[0], usage[1],
+            version.code_commit if version else None,
+            (None if version is None or version.code_dirty is None
+             else int(version.code_dirty)),
+            version.system_prompt_sha if version else None,
+            version.model if version else None,
+            version.effort if version else None,
         ),
     )
     cycle_id = cursor.lastrowid
@@ -2235,6 +2317,7 @@ def write_prompt_log(
     prompt: str,
     mode: str,
     timestamp: datetime,
+    version: AgentVersion | None = None,
     log_dir: str = PROMPT_LOG_DIR,
 ) -> str:
     """Write this cycle's prompt to logs/prompts/{cycle_id}.txt and return the path.
@@ -2252,7 +2335,13 @@ def write_prompt_log(
             f"mode      {mode}\n"
             f"model     {config.CLAUDE_MODEL}\n"
             f"effort    {config.CLAUDE_EFFORT}\n"
-            "\n"
+            + (
+                f"code      {version.code_commit}"
+                f"{' (uncommitted edits)' if version.code_dirty else ''}\n"
+                f"sysprompt {version.system_prompt_sha}\n"
+                if version else ""
+            )
+            + "\n"
             "=== SYSTEM PROMPT ===\n"
             f"{SYSTEM_PROMPT}\n"
             "\n"
@@ -2270,6 +2359,8 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
     """Run one full gather -> decide -> validate -> execute -> log cycle."""
     conn = init_db(db_path)
     cycles_completed = 0
+    # Taken before anything runs, so an edit made mid-cycle cannot relabel it.
+    version = current_agent_version()
     try:
         now = markettime.now_utc()
         portfolio = fetch_portfolio_state(mode)
@@ -2297,13 +2388,13 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         # name the cycle that made them.
         cycle_id = log_decision_cycle(
             conn, prompt, raw_response, validated, reviews, portfolio, now, mode,
-            usage,
+            usage, version,
         )
         thesis_counts = apply_thesis_lifecycle(
             conn, validated, reviews, portfolio, now, cycle_id,
         )
         cycles_completed = 1
-        prompt_path = write_prompt_log(cycle_id, prompt, mode, now)
+        prompt_path = write_prompt_log(cycle_id, prompt, mode, now, version)
         _print_cycle_summary(
             cycle_id, now, validated, reviews, thesis_counts, portfolio, prompt_path,
             news_added,
