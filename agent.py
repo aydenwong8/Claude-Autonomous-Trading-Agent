@@ -1181,6 +1181,16 @@ def get_claude_decision(
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
         response = stream.get_final_message()
+    if response.stop_reason == "refusal":
+        # A safety-classifier decline returns HTTP 200 with little or no text,
+        # which would otherwise surface as an opaque JSON decode error. No
+        # fallback model is configured on purpose: a decision made by a
+        # different model would be recorded under config.CLAUDE_MODEL.
+        details = getattr(response, "stop_details", None)
+        raise RuntimeError(
+            f"{config.CLAUDE_MODEL} declined the request (stop_reason=refusal, "
+            f"category={getattr(details, 'category', None)}). No trades placed."
+        )
     raw_text = "".join(block.text for block in response.content if block.type == "text")
     if response.stop_reason == "max_tokens":
         # Truncated JSON would surface as an opaque decode error; say what it is.

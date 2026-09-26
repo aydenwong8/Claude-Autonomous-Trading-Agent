@@ -57,11 +57,13 @@ def assert_mode_allowed(mode: str) -> None:
 
 
 # --- Claude decision engine ---------------------------------------------------
-CLAUDE_MODEL = "claude-opus-5"
+CLAUDE_MODEL = "claude-opus-5-5"
 # Thinking depth and overall token spend: low | medium | high | xhigh | max.
-# `high` is the API default; this cycle is a low-frequency, high-consequence
-# decision where reasoning quality matters far more than the per-call cost.
-CLAUDE_EFFORT = "xhigh"
+# Set explicitly: Opus 5.5 defaults to `medium`, one level below Opus 5's
+# `high`, and thinking cannot be disabled — effort is the only depth control.
+# Cycles up to 47 ran Opus 5 at `xhigh`; compare performance across the switch
+# by the model/effort recorded on each decision_cycles row.
+CLAUDE_EFFORT = "medium"
 # Each cycle returns a full review per open position plus any trades, so this
 # scales with position count — 2048 truncated mid-JSON at only 5 positions.
 # Thinking tokens count against this too, so raising CLAUDE_EFFORT eats into
