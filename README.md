@@ -2,7 +2,7 @@
  
 ## Overview
  
-This project evaluates the effectiveness of **Claude (Anthropic)** as an autonomous algorithmic trading decision-maker. The goal is to systematically test whether a large language model can construct and manage a real-money portfolio that outperforms or competes with the S&P 500 Index.
+This project evaluates the effectiveness of **Claude (Anthropic)** as an autonomous algorithmic trading decision-maker. The goal is to systematically test whether a large language model can construct and manage a portfolio that earns the **best risk-adjusted return against the S&P 500 (SPY)** — judged on Sharpe ratio, alpha, and drawdown, not raw return alone. It currently runs on an Alpaca paper account.
  
 Unlike traditional quantitative models, this project explores how well an AI agent can:
  
@@ -14,7 +14,7 @@ The agent operates fully autonomously within hard, code-enforced guardrails. No 
  
 ## Objectives
  
-- Measure the performance of Claude-driven portfolio decisions with real capital
+- Measure the risk-adjusted performance of Claude-driven portfolio decisions
 - Compare results against the S&P 500 (SPY) benchmark
 - Analyze strengths and weaknesses of LLM-based trading strategies
 - Evaluate consistency, risk exposure, and adaptability over time
@@ -118,7 +118,7 @@ auditable rather than merely active.
 ## Rollout Phases
  
 - **Phase 1 — Paper (4–8 weeks):** identical code, Alpaca paper-trading keys. Goal: shake out bugs, verify logging, watch behavior.
-- **Phase 2 — Live (small):** swap to live API keys with a small, loss-tolerable amount of capital.
+- **Phase 2 — Live (small):** swap to live API keys with a small, loss-tolerable amount of capital. **Deferred, no date set** — the focus for now is improving risk-adjusted returns on paper.
 - **Phase 3 — Project layer:** performance dashboard vs. SPY, automated trade-reasoning writeups, optional auto-posting. (The dashboard is built — `dashboard.py`.)
 
 Phase 1 is not finished. The gate for Phase 2 is not elapsed time but evidence the full
@@ -128,7 +128,9 @@ untested exit is going live on the half of the system that decides when to stop 
 money.
 ## Evaluation Metrics
  
-**Performance:** Total Return (%), Annualized Return, Alpha vs. S&P 500, Sharpe Ratio, Maximum Drawdown
+**Performance (primary — risk-adjusted):** Sharpe Ratio, Alpha vs. S&P 500, Maximum Drawdown
+
+**Performance (context):** Total Return (%), Annualized Return
  
 **Behavioral:** Turnover rate, consistency of decisions, reaction to volatility/news events, frequency of rejected (guardrail-violating) proposals
 
@@ -163,19 +165,19 @@ Per-position lookups take coverage of holdings to 100% for about 0.6s per cycle.
 ## Tech Stack
  
 - Python — standard library only for analysis; no Pandas/NumPy dependency
-- **Anthropic API (Claude Opus 5)** — decision engine, structured JSON output
+- **Anthropic API (Claude Opus 5.5, medium effort)** — decision engine, structured JSON output
 - **Alpaca API** — brokerage, market data, and news
 - SQLite — decision, thesis, and performance logging
 - launchd (`run_daily.sh`) — weekdays at 16:30 ET, skipping market holidays
 ## API Costs
  
-- **Anthropic API:** pay-as-you-go per token, separate from any Claude.ai subscription. Measured, not estimated: a daily cycle over the 1,519-symbol universe is **~26,800 input tokens ≈ $0.20/run**, or **~$4/month** at 21 trading days (Claude Opus 5, $5/$25 per million tokens). Widening the universe from 520 to 1,519 symbols added only ~$1.30/month — prompt size scales at roughly 12.6 tokens per ticker, and the news sample is capped so it does not scale at all.
+- **Anthropic API:** pay-as-you-go per token, separate from any Claude.ai subscription. Measured, not estimated: on Claude Opus 5.5 at medium effort ($4/$20 per million tokens), cycles 48–50 averaged **~45,000 input and ~5,500 output tokens ≈ $0.29/run**, or **~$6/month** at 21 trading days. The prompt grew from ~27k tokens as the self-history, news archive, and candidate screen were added; output fell sharply on the move from Opus 5 at xhigh effort (~17k output tokens, ~$0.67/run).
 - **Alpaca:** free (commission-free trading, free paper environment)
 - **Market data and news:** included with Alpaca at no additional cost
 
 ## Key Questions This Project Explores
  
-- Can an autonomous LLM agent outperform passive investing with real money?
+- Can an autonomous LLM agent beat passive investing on a risk-adjusted basis?
 - Does written AI reasoning translate into coherent, consistent strategy?
 - How does Claude handle volatility and negative news?
 - How often does the model propose trades that violate its constraints?

@@ -6,8 +6,9 @@ Guidance for Claude Code (claude.ai/code) working in this repository.
 
 Implemented and running. The full five-stage pipeline exists and executes
 automatically on weekdays against an Alpaca **paper** account (Phase 1 of the
-rollout in README.md). As of the latest cycles the DB holds ~10 decision cycles
-and ~10 open theses. Nothing runs against live money yet.
+rollout in README.md). Through 2026-09-30 the DB holds 50 decision cycles and 12
+open theses, none ever closed. Nothing runs against live money, and Phase 2
+(live) is deferred with no date — there is no plan to go live soon.
 
 README.md is the original design doc and is now partly stale — where it and the
 code disagree, **the code wins**. Known divergences are flagged below.
@@ -18,6 +19,12 @@ An experiment testing whether Claude can act as an autonomous trading
 decision-maker, managing a portfolio via Alpaca and benchmarked against SPY.
 Zero human override: every trade is proposed by Claude and then accepted or
 rejected by code-enforced guardrails, never by a human in the loop.
+
+**The objective is the best risk-adjusted return against the S&P 500 (SPY)** —
+Sharpe, alpha, and drawdown, not raw return. Judge a change by whether it
+improves that, measured per agent version (`decision_cycles.code_commit`).
+The operator's stance is to let Claude mostly do its own thing: change the
+inputs and the plumbing, not its individual decisions.
 
 ## Modules
 
