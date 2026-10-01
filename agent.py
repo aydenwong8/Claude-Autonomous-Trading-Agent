@@ -136,6 +136,11 @@ class MarketContext:
     screen: dict[str, dict[str, Any]]
     # The shortlist actually shown to the model, drawn across four buckets.
     candidates: list[str]
+    # True when the bar fetch behind `screen` failed. An empty shortlist then
+    # means "not looked up", and the prompt has to say so: on cycle 48 a
+    # connection reset produced `"candidates": []`, which the model read as a
+    # screen that found nothing worth considering.
+    screen_failed: bool = False
 
 
 @dataclass
@@ -423,6 +428,8 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
     # above stays the freshest available mark because it sizes orders, while the
     # screen answers a different question and wants a consistent bar series.
     screen = compute_screen_stats(symbols)
+    screen_failed = screen is None
+    screen = screen or {}
     candidates = select_candidates(screen, portfolio.positions.keys())
 
     # Candidates get their own lookup too, smaller than a holding's. A buy has
@@ -454,6 +461,7 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
         watchlist=watchlist,
         screen=screen,
         candidates=candidates,
+        screen_failed=screen_failed,
     )
 
 
@@ -464,7 +472,7 @@ def _pct_change(now: float, then: float) -> float | None:
     return round((now / then - 1) * 100, 2)
 
 
-def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]]:
+def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]] | None:
     """Momentum, range position, realised volatility and liquidity per symbol.
 
     Computed from daily bars over `config.SCREEN_LOOKBACK_DAYS`. The whole
@@ -474,26 +482,36 @@ def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]]:
 
     A failure here degrades the prompt to positions-only; it must not abort a
     cycle, because the position reviews and the guardrails do not depend on it.
+    It is retried once, then returns None — distinct from an empty result, so
+    the prompt can say the screen did not run rather than that it found nothing.
     """
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
-    from alpaca.data.enums import DataFeed
+    from alpaca.data.enums import Adjustment, DataFeed
 
     start = datetime.now(timezone.utc) - timedelta(days=config.SCREEN_LOOKBACK_DAYS)
-    try:
-        bars = _data_client().get_stock_bars(
-            StockBarsRequest(
-                symbol_or_symbols=symbols,
-                timeframe=TimeFrame.Day,
-                start=start,
-                # The free tier rejects recent SIP data; IEX is what dashboard.py
-                # uses for its SPY series too, so both curves come off one feed.
-                feed=DataFeed.IEX,
-            )
-        ).data
-    except Exception as exc:
-        print(f"  screen: bar fetch failed ({exc}) — continuing without candidates")
-        return {}
+    request = StockBarsRequest(
+        symbol_or_symbols=symbols,
+        timeframe=TimeFrame.Day,
+        start=start,
+        # The free tier rejects recent SIP data; IEX is what dashboard.py
+        # uses for its SPY series too, so both curves come off one feed.
+        feed=DataFeed.IEX,
+        # alpaca-py defaults to RAW, which turns every split in the lookback
+        # into a fake crash: BKNG and NFLX were shown ~95% below their 52-week
+        # highs on cycle 50. SPLIT rather than ALL keeps "last" the real close
+        # instead of a dividend-adjusted figure.
+        adjustment=Adjustment.SPLIT,
+    )
+    for attempt in (1, 2):
+        try:
+            bars = _data_client().get_stock_bars(request).data
+            break
+        except Exception as exc:
+            if attempt == 2:
+                print(f"  screen: bar fetch failed twice ({exc}) — continuing without candidates")
+                return None
+            print(f"  screen: bar fetch failed ({exc}) — retrying once")
 
     stats: dict[str, dict[str, Any]] = {}
     for symbol, series in bars.items():
@@ -1076,6 +1094,12 @@ def build_decision_prompt(
             for s in market.candidates
             if s in market.screen
         ],
+        **({"candidates_lookup_failed": (
+            "Today's screen did not run (the price-history fetch failed), so "
+            "\"candidates\" is empty because nothing was looked up, not because "
+            "nothing qualified, and holdings carry no \"screen\" block. Do not "
+            "read the empty list as an absence of alternatives."
+        )} if market.screen_failed else {}),
         # Kept separate on purpose. position_news is complete — every holding was
         # looked up, so an empty list genuinely means no recent news and is
         # itself information. It is read from the archive, split at the previous
