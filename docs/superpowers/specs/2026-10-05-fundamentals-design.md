@@ -112,12 +112,14 @@ Rules:
   is omitted and named in `not_available`.
 - **Rounding:** ratios to 1 decimal, dollar amounts to `usd_bn` with 2 decimals,
   EPS to 2 decimals. Keys sort deterministically, so the prompt is reproducible.
-- **`new_since_your_last_cycle`** is true for a filing, or a `last_4_quarters`
-  entry, dated after the previous decision cycle's timestamp. This is the same
-  rule `news.py` uses.
+- **`new_since_your_last_cycle`** is true for a filing accepted by the SEC after
+  the previous decision cycle's timestamp. This is the same rule `news.py` uses.
+  (Not applied to `last_4_quarters`: Finnhub gives each quarter's period end, not
+  its report date. A fresh print shows up as a new 8-K item 2.02 instead.)
 - **Absences are named:** `"not_available": ["forward_pe", ...]` for fields a
-  source did not return; `"not_applicable": "ETF"` for funds (SPY, QQQ, any
-  symbol EDGAR marks as an investment company or that has no `us-gaap` facts).
+  source did not return; `"not_applicable"` for funds. They are named explicitly
+  (`FUND_SYMBOLS = {SPY, QQQ}`, the only funds in the watchlist) rather than
+  inferred, so a misfiring guess can never hide a real company's data.
 - **Failures are named:** `"lookup_failed": {"finnhub": "<short reason>"}` and/or
   `{"edgar": "<short reason>"}`. Data from the source that worked is still shown.
 - **Size target:** ~250 tokens per name, ~12k per cycle, about $0.05 at Opus 5.5
@@ -160,8 +162,16 @@ tested on its own:
   - net income: `NetIncomeLoss`, `ProfitLoss`
   - diluted EPS: `EarningsPerShareDiluted`
 
-  Quarterly values are the ~3-month-duration facts (a `frame` like `CY2026Q2`).
-  A figure no concept supplies goes in `not_available`.
+  Quarters are found by duration (80–100-day periods from 10-Q/10-K filings),
+  **not** by the SEC's `frame` labels, which are sparse: GD's off-calendar
+  quarters mostly carry none. A figure no concept supplies goes in
+  `not_available`. If the filings list shows a 10-Q/10-K the facts don't
+  contain yet (the SEC's data can lag by months; GD's 2026-07-29 10-Q was
+  absent on 2026-10-05), the block names it as
+  `newer_filing_not_yet_in_sec_data`, and the cached copy is not reused until
+  the data catches up. Cached files unused for 30 days are pruned.
+- Finnhub estimates filed under a different share class (BRK.B's under BRK.A,
+  whose per-share figures are ~1,500×) are withheld with a note, not shown.
 - `material_filings(submissions, since, last_cycle_at)`: keeps forms `8-K`,
   `8-K/A`, `10-Q`, `10-K`, `10-12B`, `10-12G`, `S-4`, `425`, filed within 90 days.
   8-K item codes are translated with a fixed table (e.g. `2.02` "Results of
@@ -213,7 +223,7 @@ The cycle never fails because of fundamentals:
   - concept fallbacks (JPM)
   - the form filter and 8-K item translation
   - the `new_since_your_last_cycle` boundary
-  - ETF `not_applicable`
+  - fund `not_applicable`
   - rounding and deterministic key order
   - every failure row in the table above
   - the rate limiter under a fake clock
