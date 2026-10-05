@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 import config
 import markettime
+from fundamentals import fetch_fundamentals
 from models import (  # re-exported: agent.X must keep working
     Position,
     PendingOrder,
@@ -123,6 +124,26 @@ def current_agent_version() -> AgentVersion:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def fundamentals_for(conn, portfolio, market, now: datetime) -> dict[str, dict]:
+    """Fundamentals for every name in the prompt: holdings and candidates.
+
+    Never fails the cycle. fetch_fundamentals already turns data and network
+    problems into per-name `lookup_failed`; this also covers a bug in it, so
+    the agent decides on prices and news alone rather than not at all.
+    """
+    symbols = sorted(set(portfolio.positions) | set(market.candidates))
+    (last,) = conn.execute("SELECT MAX(timestamp) FROM decision_cycles").fetchone()
+    last_cycle_at = datetime.fromisoformat(last) if last else None
+    try:
+        blocks = fetch_fundamentals(symbols, last_cycle_at, now)
+    except Exception:
+        traceback.print_exc()
+        return {s: {"lookup_failed": {"fundamentals": "internal error"}} for s in symbols}
+    flagged = sum("lookup_failed" in b for b in blocks.values())
+    print(f"fundamentals: {len(blocks)} names, {flagged} with a failed lookup")
+    return blocks
+
+
 def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
     """Run one full gather -> decide -> validate -> execute -> log cycle."""
     conn = init_db(db_path)
@@ -145,8 +166,10 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         )
         theses = fetch_open_theses(conn)
         actions = fetch_action_history(conn)
+        fundamentals = fundamentals_for(conn, portfolio, market, now)
         prompt = build_decision_prompt(
             portfolio, market, theses, actions, news_history, candidate_news, now,
+            fundamentals,
         )
         trades, reviews, raw_response, usage = get_claude_decision(prompt)
         validated = validate_trades(trades, portfolio, mode)

@@ -213,6 +213,33 @@ Nothing obliges you to act on it. An empty-handed cycle where you looked and fou
 nothing worth owning is a fine outcome and you should say so. A cycle where you did \
 not look is not.
 
+WHAT "fundamentals" IS
+
+Every holding and every candidate carries a "fundamentals" block, looked up fresh \
+each cycle from two sources:
+- "valuation" and "growth_and_quality" (Finnhub): trailing-twelve-month (TTM) \
+  figures. "_5y_range" and "_5y_median" give the same measure over the last 20 \
+  quarters, so a current figure can be read against the company's own history.
+- "earnings" (Finnhub): the next scheduled report with the consensus EPS and \
+  revenue estimates, and the last four quarters' EPS against the estimate at the \
+  time. Consensus is the average of analysts' forecasts, not a target.
+- "reported_results" (SEC EDGAR, from the company's own 10-Q/10-K): the latest \
+  quarter in the SEC's structured data against the same quarter a year earlier. \
+  That data can lag a filing by weeks or months; when it does, \
+  "newer_filing_not_yet_in_sec_data" names the filing it is missing, and the \
+  figures are older than that filing.
+- "material_filings_90d" (EDGAR): 8-Ks with their item descriptions, 10-Qs, 10-Ks \
+  and spin-off or merger registrations from the last 90 days, one line each. \
+  "[new since your last cycle]" marks filings you have not been shown before.
+
+"not_available" names figures the source does not provide for that company (banks, \
+for example, report no operating margin). "not_applicable" marks funds, which have \
+no company financials. "lookup_failed" means that source was not reached this \
+cycle, so its silence says nothing about the company.
+
+These are reported figures and published estimates, not judgements. Nothing in the \
+block says whether a stock is cheap, whether a quarter was good, or what to do.
+
 Guardrails your proposals will be checked against:
 - Max position size: 15% of portfolio equity per ticker (post-trade)
 - Universe: long-only, whitelisted US equities/ETFs only
@@ -314,6 +341,7 @@ def build_decision_prompt(
     news_history: dict[str, dict[str, Any]],
     candidate_news: dict[str, list[str]],
     as_of: datetime,
+    fundamentals: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Assemble the prompt sent to Claude, instructing it to return trades as
     structured JSON with written reasoning per trade.
@@ -349,6 +377,8 @@ def build_decision_prompt(
         # use of the capital?" has no basis to be answered on.
         if p.symbol in market.screen:
             row["screen"] = market.screen[p.symbol]
+        if fundamentals and p.symbol in fundamentals:
+            row["fundamentals"] = fundamentals[p.symbol]
         t = theses.get(p.symbol)
         if t:
             opened = datetime.fromisoformat(t.opened_at)
@@ -460,6 +490,7 @@ def build_decision_prompt(
             {
                 "symbol": s,
                 **market.screen[s],
+                **({"fundamentals": fundamentals[s]} if fundamentals and s in fundamentals else {}),
                 **({"recent_news": candidate_news[s]} if s in candidate_news else {}),
                 **({"your_track_record": actions[s]} if s in actions else {}),
             }

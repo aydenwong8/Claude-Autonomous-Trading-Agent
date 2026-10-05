@@ -183,14 +183,17 @@ def test_http_malformed_json_is_a_lookup_failure():
 def test_gd_block(tmp_path):
     gd = blocks(tmp_path)[0]["GD"]
     assert gd["valuation"]["pe_ttm"] == 19.9
-    assert gd["valuation"]["pe_ttm_5y_range"] == [16.7, 23.6]
-    assert gd["growth_and_quality"]["operating_margin_5y_range_pct"] == [9.5, 11.5]
+    assert gd["valuation"]["pe_ttm_5y_range"] == "16.7 to 23.6"
+    assert gd["growth_and_quality"]["operating_margin_5y_range_pct"] == "9.5 to 11.5"
     assert gd["earnings"]["next_report"] == "2026-10-22 before open"
     assert gd["earnings"]["days_until"] == 17
     assert gd["earnings"]["consensus_eps"] == 4.25
-    assert gd["earnings"]["last_4_quarters"][0] == {
-        "quarter": "2026Q2", "eps_actual": 4.24, "eps_estimate": 4.09, "surprise_pct": 3.7,
-    }
+    assert gd["earnings"]["last_4_quarters"] == [
+        "2026Q2: EPS 4.24 vs 4.09 est (+3.7%)",
+        "2026Q1: EPS 4.1 vs 3.79 est (+8.2%)",
+        "2025Q4: EPS 4.17 vs 4.22 est (-1.1%)",
+        "2025Q3: EPS 3.88 vs 3.81 est (+1.8%)",
+    ]
     results = gd["reported_results"]
     assert results["source"] == "10-Q, quarter ended 2026-04-05, filed 2026-04-29"
     assert results["revenue_usd_bn"] == 13.48
@@ -201,12 +204,25 @@ def test_gd_block(tmp_path):
     assert "lookup_failed" not in gd
 
 
-def test_filings_are_material_only_and_items_are_translated(tmp_path):
+def test_filings_are_material_only_one_line_each(tmp_path):
     filings = blocks(tmp_path)[0]["GD"]["material_filings_90d"]
-    assert filings and all(x["form"] in f.MATERIAL_FORMS for x in filings)
-    results = [x for x in filings if "2.02" in x.get("items", "")]
-    assert results[0]["items"].startswith("2.02 Results of operations")
-    assert [x["date"] for x in filings] == sorted((x["date"] for x in filings), reverse=True)
+    # Newest first; insider forms dropped; 9.01 (exhibits) dropped beside other items.
+    assert filings[:4] == [
+        "2026-08-07 8-K: 5.02 Officer or director change",
+        "2026-08-04 8-K: 8.01 Other events",
+        "2026-07-29 10-Q",
+        "2026-07-29 8-K: 2.02 Results of operations",
+    ]
+    assert not any("Form 4" in x or x.split()[1] == "4" for x in filings)
+
+
+def test_only_exhibits_keeps_the_item():
+    submissions = {"filings": {"recent": {
+        "form": ["8-K"], "filingDate": ["2026-10-01"], "items": ["9.01"],
+        "acceptanceDateTime": ["2026-10-01T12:00:00.000Z"], "accessionNumber": ["x"],
+    }}}
+    assert f.material_filings(submissions, TODAY, NOW) == [
+        "2026-10-01 8-K: 9.01 Financial statements and exhibits"]
 
 
 def test_bank_line_items(tmp_path):
@@ -244,8 +260,8 @@ def test_funds_are_not_applicable_and_not_looked_up(tmp_path):
 def test_new_since_last_cycle_uses_the_acceptance_time(tmp_path, last, expected):
     gd = blocks(tmp_path, symbols=("GD",), last=last)[0]["GD"]
     newest = gd["material_filings_90d"][0]
-    assert newest["date"] == "2026-08-07"  # accepted 2026-08-07T21:11:06Z
-    assert newest["new_since_your_last_cycle"] is expected
+    assert newest.startswith("2026-08-07 8-K")  # accepted 2026-08-07T21:11:06Z
+    assert newest.endswith(" [new since your last cycle]") is expected
 
 
 def test_output_is_deterministic(tmp_path):

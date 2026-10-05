@@ -279,7 +279,8 @@ def valuation_block(metric_json: dict[str, Any], missing: list[str]) -> dict[str
     _put(out, missing, "pe_ttm", _round(m.get("peTTM"), 1))
     history = five_year(quarterly.get("peTTM"))
     if history:
-        out["pe_ttm_5y_range"], out["pe_ttm_5y_median"] = history
+        out["pe_ttm_5y_range"] = _span(history[0])
+        out["pe_ttm_5y_median"] = history[1]
     else:
         missing.append("pe_ttm_5y_range")
     _put(out, missing, "forward_pe", _round(m.get("forwardPE"), 1))
@@ -300,7 +301,7 @@ def growth_block(metric_json: dict[str, Any], missing: list[str]) -> dict[str, A
     # The quarterly series is a fraction; the TTM figure above is a percent.
     history = five_year(quarterly.get("operatingMargin"), scale=100.0)
     if history:
-        out["operating_margin_5y_range_pct"] = history[0]
+        out["operating_margin_5y_range_pct"] = _span(history[0])
     else:
         missing.append("operating_margin_5y_range_pct")
     _put(out, missing, "roe_ttm_pct", _round(m.get("roeTTM"), 1))
@@ -348,16 +349,26 @@ def earnings_block(
         if len(own) < len(history_json):
             missing.append("last_4_quarters (reported under a different share class)")
         elif own:
+            # One line per quarter: as structured JSON these were a fifth
+            # of the whole block once indented into the prompt.
             out["last_4_quarters"] = [
-                {
-                    "quarter": f"{h['year']}Q{h['quarter']}",
-                    "eps_actual": _round(h.get("actual"), 2),
-                    "eps_estimate": _round(h.get("estimate"), 2),
-                    "surprise_pct": _round(h.get("surprisePercent"), 1),
-                }
+                _quarter_line(h)
                 for h in sorted(own, key=lambda h: h.get("period") or "", reverse=True)
             ]
     return out
+
+
+def _quarter_line(h: dict[str, Any]) -> str:
+    actual, estimate = _round(h.get("actual"), 2), _round(h.get("estimate"), 2)
+    surprise = _round(h.get("surprisePercent"), 1)
+    line = (f"{h['year']}Q{h['quarter']}: EPS "
+            f"{'n/a' if actual is None else actual} vs "
+            f"{'n/a' if estimate is None else estimate} est")
+    return line if surprise is None else f"{line} ({surprise:+.1f}%)"
+
+
+def _span(bounds: list[float]) -> str:
+    return f"{bounds[0]} to {bounds[1]}"
 
 
 def _quarter_values(facts: dict[str, Any], concepts: tuple[str, ...]) -> dict[str, dict[str, Any]]:
@@ -457,7 +468,10 @@ def latest_report(submissions: dict[str, Any]) -> dict[str, str] | None:
 
 def material_filings(
     submissions: dict[str, Any], today: date, last_cycle_at: datetime | None,
-) -> list[dict[str, Any]]:
+) -> list[str]:
+    """One line per filing, newest first: "2026-07-29 8-K: 2.02 Results of
+    operations [new since your last cycle]". Lines rather than objects, which
+    cost several times the tokens once indented into the prompt."""
     recent = (submissions.get("filings") or {}).get("recent") or {}
     cutoff = (today - timedelta(days=config.FILINGS_LOOKBACK_DAYS)).isoformat()
     out = []
@@ -465,14 +479,20 @@ def material_filings(
         filed = recent["filingDate"][i]
         if form not in MATERIAL_FORMS or filed < cutoff:
             continue
-        entry: dict[str, Any] = {"date": filed, "form": form}
+        line = f"{filed} {form}"
         codes = [c for c in ((recent.get("items") or [""] * (i + 1))[i] or "").split(",") if c]
+        if len(codes) > 1:
+            # 9.01 lists the exhibits; beside a real item it adds nothing.
+            codes = [c for c in codes if c != "9.01"]
         if codes:
-            entry["items"] = "; ".join(f"{c} {EIGHT_K_ITEMS.get(c, '')}".strip() for c in codes)
+            line += ": " + "; ".join(f"{c} {EIGHT_K_ITEMS.get(c, '')}".strip() for c in codes)
         accepted = datetime.fromisoformat(_accepted_at(recent, i).replace("Z", "+00:00"))
-        entry["new_since_your_last_cycle"] = last_cycle_at is None or accepted > last_cycle_at
-        out.append(entry)
-    return sorted(out, key=lambda e: e["date"], reverse=True)
+        if last_cycle_at is None or accepted > last_cycle_at:
+            line += " [new since your last cycle]"
+        out.append(line)
+    # By date only: the SEC lists newest first, and a stable sort keeps that
+    # order within a day (sorting whole lines would put "8-K" after "10-Q").
+    return sorted(out, key=lambda line: line[:10], reverse=True)
 
 
 def _put(out: dict[str, Any], missing: list[str], key: str, value: Any) -> None:

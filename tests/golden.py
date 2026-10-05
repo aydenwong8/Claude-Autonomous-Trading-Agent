@@ -56,6 +56,7 @@ def build_prompt(db_path: Path, inputs: dict) -> str:
         conn.close()
     return agent.build_decision_prompt(
         portfolio, market, theses, actions, news_history, candidate_news, now,
+        inputs.get("fundamentals"),
     )
 
 
@@ -71,9 +72,11 @@ def capture(source_db: Path = ROOT / config.DEFAULT_DB_PATH) -> None:
     market = agent.fetch_market_context(config.WATCHLIST, portfolio)
     agent.price_pending_orders(portfolio, market.prices)
     agent.store_news(dst, market.articles, now)
+    fundamentals = agent.fundamentals_for(dst, portfolio, market, now)
     dst.close()
 
-    inputs = {"now": now, "portfolio": portfolio, "market": market}
+    inputs = {"now": now, "portfolio": portfolio, "market": market,
+              "fundamentals": fundamentals}
     INPUTS.write_bytes(pickle.dumps(inputs))
     PROMPT.write_text(build_prompt(DB, inputs))
     SYSTEM_SHA.write_text(system_prompt_sha())

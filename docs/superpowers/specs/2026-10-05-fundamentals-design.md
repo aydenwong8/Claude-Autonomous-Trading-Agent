@@ -76,22 +76,20 @@ data, for holdings and candidates alike. Shape (GD, illustrative values):
 ```json
 "fundamentals": {
   "valuation": {
-    "pe_ttm": 19.9, "pe_ttm_5y_range": [16.8, 23.1], "pe_ttm_5y_median": 20.4,
+    "pe_ttm": 19.9, "pe_ttm_5y_range": "16.8 to 23.1", "pe_ttm_5y_median": 20.4,
     "forward_pe": 19.0, "ev_ebitda_ttm": 14.0, "price_to_sales_ttm": 1.6,
     "dividend_yield_pct": 2.1
   },
   "growth_and_quality": {
     "revenue_growth_yoy_ttm_pct": 9.1, "revenue_growth_yoy_last_quarter_pct": 8.1,
     "eps_growth_yoy_ttm_pct": 10.1, "operating_margin_ttm_pct": 10.3,
-    "operating_margin_5y_range_pct": [9.6, 11.2], "roe_ttm_pct": 17.4,
+    "operating_margin_5y_range_pct": "9.6 to 11.2", "roe_ttm_pct": 17.4,
     "debt_to_equity": 0.28
   },
   "earnings": {
     "next_report": "2026-10-22 before open", "days_until": 17,
     "consensus_eps": 4.25, "consensus_revenue_usd_bn": 14.14,
-    "last_4_quarters": [
-      {"quarter": "2026Q2", "eps_actual": 4.24, "eps_estimate": 4.09, "surprise_pct": 3.7}
-    ]
+    "last_4_quarters": ["2026Q2: EPS 4.24 vs 4.09 est (+3.7%)", "..."]
   },
   "reported_results": {
     "source": "10-Q, quarter ended 2026-07-05, filed 2026-07-29",
@@ -100,8 +98,8 @@ data, for holdings and candidates alike. Shape (GD, illustrative values):
     "same_quarter_last_year": {"revenue_usd_bn": 12.8, "diluted_eps": 3.74}
   },
   "material_filings_90d": [
-    {"date": "2026-07-22", "form": "8-K", "items": "2.02 Results of operations",
-     "new_since_your_last_cycle": false}
+    "2026-07-29 8-K: 2.02 Results of operations",
+    "2026-08-07 8-K: 5.02 Officer or director change [new since your last cycle]"
   ]
 }
 ```
@@ -112,7 +110,7 @@ Rules:
   is omitted and named in `not_available`.
 - **Rounding:** ratios to 1 decimal, dollar amounts to `usd_bn` with 2 decimals,
   EPS to 2 decimals. Keys sort deterministically, so the prompt is reproducible.
-- **`new_since_your_last_cycle`** is true for a filing accepted by the SEC after
+- **`[new since your last cycle]`** is appended to a filing accepted by the SEC after
   the previous decision cycle's timestamp. This is the same rule `news.py` uses.
   (Not applied to `last_4_quarters`: Finnhub gives each quarter's period end, not
   its report date. A fresh print shows up as a new 8-K item 2.02 instead.)
@@ -122,9 +120,14 @@ Rules:
   inferred, so a misfiring guess can never hide a real company's data.
 - **Failures are named:** `"lookup_failed": {"finnhub": "<short reason>"}` and/or
   `{"edgar": "<short reason>"}`. Data from the source that worked is still shown.
-- **Size target:** ~250 tokens per name, ~12k per cycle, about $0.05 at Opus 5.5
-  input pricing. The dry run (see Rollout) must confirm it; if it exceeds 20k,
-  `last_4_quarters` drops to 2 for candidates before anything else is cut.
+- **Size (measured 2026-10-05, not estimated):** the first dry run added 55.6k
+  tokens (1,209 per name), against an estimate of ~12k. Rendering filings and
+  earnings quarters as one line each, and 5-year ranges as "a to b", brought it
+  to **~40.6k tokens (~880 per name), about $0.16 per cycle** at Opus 5.5 input
+  pricing. Fully compact JSON would still be ~34k: the figures themselves are
+  the cost. The operator chose to keep every field for every name rather than
+  cut to the original 20k cap. If reviews look swamped, trim later and compare
+  by version.
 - **System prompt:** one paragraph says what the block is, where each part comes
   from, the as-of semantics (TTM, latest filed quarter), and that
   `lookup_failed` means "not looked up", not "nothing to report". It gives no
