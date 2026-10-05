@@ -30,16 +30,39 @@ inputs and the plumbing, not its individual decisions.
 
 | File | Role |
 |---|---|
-| `agent.py` | The whole pipeline: gather → decide → validate → execute → log, plus the SQLite schema, the thesis lifecycle, the self-history injection (`fetch_action_history`), and the system prompt. The only module that writes anything. |
+| `agent.py` | Entry point and pipeline: `run_decision_cycle` (gather → decide → validate → execute → log), `current_agent_version`, the CLI, and `load_dotenv()`. Re-exports every name the pre-split `agent.py` defined, so `agent.X` still works. |
+| `models.py` | Dataclasses shared across the pipeline (portfolio, market, theses, trades, `AgentVersion`). |
+| `broker.py` | Alpaca clients (the live-mode lock lives in `_trading_client`), account and pending-order state, order execution and `client_order_id`. |
+| `screen.py` | `fetch_market_context` and the candidate screen. |
+| `news.py` | News fetching, the archive, and per-symbol news history. |
+| `prompt.py` | `SYSTEM_PROMPT` and `build_decision_prompt`. |
+| `decide.py` | The Claude call and response parsing. |
+| `guardrails.py` | `validate_trades`: every code-enforced guardrail. |
+| `theses.py` | Open theses, action history (`fetch_action_history`), the thesis lifecycle, orphan cleanup. |
+| `db.py` | Schema, migrations, run/cycle logging, prompt log. |
+| `tools/split_agent.py` | One-off script that performed the 2026-10 split of `agent.py`; kept for the record. |
 | `config.py` | Guardrail thresholds, `CLAUDE_MODEL` / `CLAUDE_MAX_TOKENS`, `VALID_EXIT_TRIGGERS`, and `WATCHLIST` (S&P 1500 ∪ Nasdaq-100 plus SPY/QQQ, ~1,500 symbols, snapshotted 2026-08-05 — index membership drifts, refresh occasionally). |
 | `markettime.py` | Store UTC, display Eastern. Every display boundary — console, dashboard, report, *and the prompt Claude reads* — converts through here. Do not format timestamps ad hoc elsewhere. |
 | `dashboard.py` | Reads Alpaca + the DB, writes a self-contained `dashboard.html` (agent equity curve vs. buy-and-hold SPY, holdings, risk stats, decision log). No server, no external requests at view time. |
-| `metrics.py` | Pure functions over the DB for the README's evaluation metrics the equity curve alone can't give: annualized return, turnover (SEC N-1A `min(buys, sells)` plus a two-way variant), rejection stats, decision consistency. Imported by `dashboard.py`; covered by `test_metrics.py` (the only tests in the repo). |
+| `metrics.py` | Pure functions over the DB for the README's evaluation metrics the equity curve alone can't give: annualized return, turnover (SEC N-1A `min(buys, sells)` plus a two-way variant), rejection stats, decision consistency. Imported by `dashboard.py`; covered by `test_metrics.py`. |
 | `report.py` | Read-only, DB-only per-position report: thesis, recent verdicts, every trade including rejected ones. Safe to run mid-cycle — makes no broker calls. |
 | `run_daily.sh` | Scheduled entrypoint. Pins `TZ`, skips market holidays via Alpaca's calendar, runs `agent.py` then `dashboard.py`. |
 
-`dashboard.py` imports `_trading_client` / `_data_client` from `agent.py`, so
-changing those signatures breaks it.
+Writes happen in `broker.py` (orders) and in `db.py`, `theses.py` and `news.py`
+(rows); `agent.py` orchestrates them.
+
+`dashboard.py` imports `_trading_client` / `_data_client` from `agent`. They
+live in `broker.py` and are re-exported by `agent.py`, so that import still
+works, but changing their signatures breaks the dashboard. Importing `agent`
+is also what runs `load_dotenv()` for the dashboard.
+
+Tests (`venv/bin/python -m pytest -q`): `test_guardrails.py` covers every rule
+in `validate_trades`; `test_prompt_golden.py` requires the decision prompt to
+stay byte-identical against a gitignored fixture in `tests/fixtures/` (it skips
+when the fixture is absent). **Re-capture it with `venv/bin/python tests/golden.py`
+whenever the prompt is meant to change**, e.g. new data in the prompt.
+`test_reexports.py` guards the `agent.X` names; `test_memory.py`,
+`test_version.py` and `test_metrics.py` cover memory, versioning and metrics.
 
 ## Scheduling (the real setup)
 
@@ -69,7 +92,7 @@ whole** — `execute_trades` runs before `log_decision_cycle`, so a rerun after 
 mid-cycle failure re-enters the pipeline with orders already at the broker.
 Recovery belongs in pre-flight, not in a retry loop. What a rerun can no longer
 do is double-fill: every order carries a deterministic `client_order_id`
-(`agt-{ET date}-{symbol}-{side}-{cents}`, `agent.py:_client_order_id`), and the
+(`agt-{ET date}-{symbol}-{side}-{cents}`, `broker.py:_client_order_id`), and the
 broker rejects the duplicate. The rejection is recorded as
 `duplicate_suppressed:` in `order_status`, distinct from a real
 `submit_failed:` — one means the fill already exists, the other that it never
@@ -206,7 +229,7 @@ sample happens to cover them.
 
 ## Guardrails (code-enforced invariants, not advisory)
 
-Enforced in `agent.py:validate_trades`, thresholds in `config.py`. A trade that
+Enforced in `guardrails.py:validate_trades`, thresholds in `config.py`. A trade that
 fails any of these must be **rejected and logged, never silently adjusted**.
 
 | Rule | Value |
@@ -300,7 +323,7 @@ than killing the cycle, since account state is still usable without it.
 
 ## Database (`trading_agent.db`, gitignored)
 
-Created idempotently by `agent.py:init_db`.
+Created idempotently by `db.py:init_db`.
 
 - `decision_cycles` — one row per successful cycle: `timestamp` (UTC ISO),
   `mode`, full `prompt`, raw `claude_response`, `portfolio_cash`,
@@ -326,7 +349,7 @@ Created idempotently by `agent.py:init_db`.
   ('open' / 'buy_refresh' / 'adopt' / 'review_reanchor'), and the three case
   fields. Without this a re-anchor would rewrite history and the record would
   read as though a position had always been held for today's reason.
-  `agent.py:_migrate_thesis_revisions` adds the two `theses` columns and
+  `db.py:_migrate_thesis_revisions` adds the two `theses` columns and
   backfills revision 1 for pre-existing rows; it is keyed on the presence of
   `theses.revision`, so it is idempotent.
 - `position_reviews` — `cycle_id`, `symbol`, `verdict`, `note`. Case fields

@@ -12,19 +12,11 @@ Pipeline (see README.md#architecture):
 from __future__ import annotations
 
 import argparse
-import html
-import json
-import math
 import hashlib
 import os
-import sqlite3
-import statistics
 import subprocess
 import traceback
-from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
-from collections.abc import Iterable
-from typing import Any
+from datetime import datetime
 
 from dotenv import load_dotenv
 
