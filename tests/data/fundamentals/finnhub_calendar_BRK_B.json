@@ -1,0 +1,15 @@
+{
+ "earningsCalendar": [
+  {
+   "date": "2026-10-30",
+   "epsActual": null,
+   "epsEstimate": 8887.5226,
+   "hour": "",
+   "quarter": 3,
+   "revenueActual": null,
+   "revenueEstimate": 99761745229,
+   "symbol": "BRK.A",
+   "year": 2026
+  }
+ ]
+}

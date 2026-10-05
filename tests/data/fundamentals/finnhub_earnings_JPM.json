@@ -1,0 +1,42 @@
+[
+ {
+  "actual": 6.14,
+  "estimate": 5.906,
+  "period": "2026-06-30",
+  "quarter": 2,
+  "surprise": 0.234,
+  "surprisePercent": 3.9621,
+  "symbol": "JPM",
+  "year": 2026
+ },
+ {
+  "actual": 5.94,
+  "estimate": 5.5024,
+  "period": "2026-03-31",
+  "quarter": 1,
+  "surprise": 0.4376,
+  "surprisePercent": 7.9529,
+  "symbol": "JPM",
+  "year": 2026
+ },
+ {
+  "actual": 5.23,
+  "estimate": 5.0539,
+  "period": "2025-12-31",
+  "quarter": 4,
+  "surprise": 0.1761,
+  "surprisePercent": 3.4844,
+  "symbol": "JPM",
+  "year": 2025
+ },
+ {
+  "actual": 5.07,
+  "estimate": 4.8839,
+  "period": "2025-09-30",
+  "quarter": 3,
+  "surprise": 0.1861,
+  "surprisePercent": 3.8105,
+  "symbol": "JPM",
+  "year": 2025
+ }
+]

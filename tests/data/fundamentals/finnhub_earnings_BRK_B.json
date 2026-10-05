@@ -1,0 +1,42 @@
+[
+ {
+  "actual": 9038.3,
+  "estimate": 7594.5732,
+  "period": "2026-06-30",
+  "quarter": 2,
+  "surprise": 1443.7268,
+  "surprisePercent": 19.01,
+  "symbol": "BRK.A",
+  "year": 2026
+ },
+ {
+  "actual": 7889.445,
+  "estimate": 8078.5176,
+  "period": "2026-03-31",
+  "quarter": 1,
+  "surprise": -189.0726,
+  "surprisePercent": -2.3404,
+  "symbol": "BRK.A",
+  "year": 2026
+ },
+ {
+  "actual": 7093.185,
+  "estimate": 8431.7647,
+  "period": "2025-12-31",
+  "quarter": 4,
+  "surprise": -1338.5797,
+  "surprisePercent": -15.8754,
+  "symbol": "BRK.A",
+  "year": 2025
+ },
+ {
+  "actual": 9376.15,
+  "estimate": 8945.8442,
+  "period": "2025-09-30",
+  "quarter": 3,
+  "surprise": 430.3058,
+  "surprisePercent": 4.8101,
+  "symbol": "BRK.A",
+  "year": 2025
+ }
+]

@@ -1,0 +1,28 @@
+{
+ "metric": {
+  "10DayAverageTradingVolume": 45.66275,
+  "13WeekPriceReturnDaily": 3.3379,
+  "26WeekPriceReturnDaily": 21.7843,
+  "3MonthADReturnStd": 10.980885,
+  "3MonthAverageTradingVolume": 48.75543,
+  "52WeekHigh": 779.37,
+  "52WeekHighDate": "2026-08-13",
+  "52WeekLow": 629.28,
+  "52WeekLowDate": "2026-03-30",
+  "52WeekPriceReturnDaily": 15.0055,
+  "5DayPriceReturnDaily": 0.5264,
+  "beta": 1.0172414,
+  "monthToDatePriceReturnDaily": 0.9192,
+  "priceRelativeToS&P50013Week": 0,
+  "priceRelativeToS&P50026Week": 0,
+  "priceRelativeToS&P5004Week": 0,
+  "priceRelativeToS&P50052Week": 0,
+  "priceRelativeToS&P500Ytd": 0,
+  "yearToDatePriceReturnDaily": 12.8637
+ },
+ "metricType": "all",
+ "series": {
+  "quarterly": {}
+ },
+ "symbol": "SPY"
+}

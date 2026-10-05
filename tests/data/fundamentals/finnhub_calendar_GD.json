@@ -1,0 +1,26 @@
+{
+ "earningsCalendar": [
+  {
+   "date": "2027-01-26",
+   "epsActual": null,
+   "epsEstimate": 4.6699,
+   "hour": "amc",
+   "quarter": 4,
+   "revenueActual": null,
+   "revenueEstimate": 15120215743,
+   "symbol": "GD",
+   "year": 2026
+  },
+  {
+   "date": "2026-10-22",
+   "epsActual": null,
+   "epsEstimate": 4.2524,
+   "hour": "bmo",
+   "quarter": 3,
+   "revenueActual": null,
+   "revenueEstimate": 14143117398,
+   "symbol": "GD",
+   "year": 2026
+  }
+ ]
+}

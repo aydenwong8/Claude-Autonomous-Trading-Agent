@@ -1,0 +1,26 @@
+{
+ "earningsCalendar": [
+  {
+   "date": "2027-01-14",
+   "epsActual": null,
+   "epsEstimate": 5.9857,
+   "hour": "amc",
+   "quarter": 4,
+   "revenueActual": null,
+   "revenueEstimate": 51453674400,
+   "symbol": "JPM",
+   "year": 2026
+  },
+  {
+   "date": "2026-10-13",
+   "epsActual": null,
+   "epsEstimate": 5.9185,
+   "hour": "",
+   "quarter": 3,
+   "revenueActual": null,
+   "revenueEstimate": 51650095706,
+   "symbol": "JPM",
+   "year": 2026
+  }
+ ]
+}

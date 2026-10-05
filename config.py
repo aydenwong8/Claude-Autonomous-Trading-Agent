@@ -291,3 +291,17 @@ SCREEN_PER_BUCKET = 10
 
 # --- Storage --------------------------------------------------------------------
 DEFAULT_DB_PATH = "trading_agent.db"
+
+# --- Fundamentals (fundamentals.py) -----------------------------------------
+# Finnhub's free tier allows 60 calls/min; 55 leaves headroom for clock skew.
+FINNHUB_CALLS_PER_MIN = 55
+# The SEC asks for no more than 10 requests/second.
+EDGAR_CALLS_PER_SEC = 5
+EDGAR_CACHE_DIR = "cache/edgar"
+# Cached companyfacts files unused this long are deleted (~3.6 MB each).
+EDGAR_CACHE_MAX_AGE_DAYS = 30
+FILINGS_LOOKBACK_DAYS = 90
+# 20 quarters = the "5y" in pe_ttm_5y_range; fewer than 8 points shows no range.
+FUNDAMENTALS_HISTORY_QUARTERS = 20
+FUNDAMENTALS_MIN_HISTORY_POINTS = 8
+EARNINGS_LOOKAHEAD_DAYS = 120

@@ -1,0 +1,32 @@
+{
+ "1": {
+  "cik_str": 320193,
+  "ticker": "AAPL",
+  "title": "Apple Inc."
+ },
+ "12": {
+  "cik_str": 19617,
+  "ticker": "JPM",
+  "title": "JPMORGAN CHASE & CO"
+ },
+ "190": {
+  "cik_str": 40533,
+  "ticker": "GD",
+  "title": "GENERAL DYNAMICS CORP"
+ },
+ "7233": {
+  "cik_str": 884394,
+  "ticker": "SPY",
+  "title": "SPDR S&P 500 ETF TRUST"
+ },
+ "871": {
+  "cik_str": 14693,
+  "ticker": "BF-B",
+  "title": "BROWN FORMAN CORP"
+ },
+ "9": {
+  "cik_str": 1067983,
+  "ticker": "BRK-B",
+  "title": "BERKSHIRE HATHAWAY INC"
+ }
+}
