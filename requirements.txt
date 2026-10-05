@@ -4,3 +4,4 @@ python-dotenv==1.2.2
 
 # Dev only — the scheduled run does not import it.
 pytest==9.1.1
+pyflakes==4.0.2
