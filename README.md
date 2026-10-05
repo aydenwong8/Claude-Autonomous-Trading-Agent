@@ -144,9 +144,11 @@ comparison that silently redefines its own start date reverses its own conclusio
  
 ## Data Sources
  
-**Alpaca is the only data source.** It covers positions, account state, order execution,
-prices, and news, so no second provider is needed. Claude's training data is stale for
-markets, so all of this is injected fresh every cycle and never recalled from the model.
+**Alpaca** covers positions, account state, order execution, prices and news. **Finnhub**
+(free tier) supplies valuation and its 5-year history, earnings dates with consensus, and
+recent EPS against estimate. **SEC EDGAR** supplies reported quarterly results and material
+filings. Claude's training data is stale for markets, so all of this is injected fresh every
+cycle and never recalled from the model.
 
 News coverage is split deliberately, because the two cases have different requirements:
 
@@ -167,6 +169,7 @@ Per-position lookups take coverage of holdings to 100% for about 0.6s per cycle.
 - Python — standard library only for analysis; no Pandas/NumPy dependency
 - **Anthropic API (Claude Opus 5.5, medium effort)** — decision engine, structured JSON output
 - **Alpaca API** — brokerage, market data, and news
+- **Finnhub + SEC EDGAR** — fundamentals (valuation, earnings, reported results, filings)
 - SQLite — decision, thesis, and performance logging
 - launchd (`run_daily.sh`) — weekdays at 16:30 ET, skipping market holidays
 ## API Costs

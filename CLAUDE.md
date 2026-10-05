@@ -40,6 +40,7 @@ inputs and the plumbing, not its individual decisions.
 | `guardrails.py` | `validate_trades`: every code-enforced guardrail. |
 | `theses.py` | Open theses, action history (`fetch_action_history`), the thesis lifecycle, orphan cleanup. |
 | `db.py` | Schema, migrations, run/cycle logging, prompt log. |
+| `fundamentals.py` | Finnhub + SEC EDGAR facts per name: valuation against its own 5-year history, earnings dates with consensus, the last 4 quarters' EPS against estimate, the latest reported quarter, material filings. Never raises; failures become per-name `lookup_failed`. Cache in `cache/edgar/` (gitignored, pruned after 30 days). |
 | `tools/split_agent.py` | One-off script that performed the 2026-10 split of `agent.py`; kept for the record. |
 | `config.py` | Guardrail thresholds, `CLAUDE_MODEL` / `CLAUDE_MAX_TOKENS`, `VALID_EXIT_TRIGGERS`, and `WATCHLIST` (S&P 1500 ∪ Nasdaq-100 plus SPY/QQQ, ~1,500 symbols, snapshotted 2026-08-05 — index membership drifts, refresh occasionally). |
 | `markettime.py` | Store UTC, display Eastern. Every display boundary — console, dashboard, report, *and the prompt Claude reads* — converts through here. Do not format timestamps ad hoc elsewhere. |
@@ -61,6 +62,8 @@ in `validate_trades`; `test_prompt_golden.py` requires the decision prompt to
 stay byte-identical against a gitignored fixture in `tests/fixtures/` (it skips
 when the fixture is absent). **Re-capture it with `venv/bin/python tests/golden.py`
 whenever the prompt is meant to change**, e.g. new data in the prompt.
+`test_fundamentals.py` runs on recorded API responses in `tests/data/fundamentals/`
+(re-record with `record.py` there); `test_prompt_fundamentals.py` covers the wiring.
 `test_reexports.py` guards the `agent.X` names; `test_memory.py`,
 `test_version.py` and `test_metrics.py` cover memory, versioning and metrics.
 
@@ -158,7 +161,7 @@ This is the core behavioral design and has no README coverage.
 
 Each cycle is a **stateless single-turn call** — `messages=[{"role": "user", ...}]`,
 no conversation history. Everything the model knows about its own past has to be
-put in the prompt deliberately. Three things are:
+put in the prompt deliberately. Three things are, plus one fact feed:
 
 - **The case** (`fetch_open_theses`) — what it *believed*, injected per position.
 - **The record** (`fetch_action_history`) — what it *did*, injected per position
@@ -195,6 +198,16 @@ put in the prompt deliberately. Three things are:
   `BRK/B` and never `BRK.B` — until 2026-09-22 every BRK.B lookup returned
   nothing, and the prompt presented that as a complete lookup finding no news
   across 40 reviews. Same applies to `BF.B` and `MOG.A`.
+- **The fundamentals** (`agent.fundamentals_for` → `fundamentals.fetch_fundamentals`):
+  facts, not verdicts, for every holding and candidate, attached as `fundamentals`.
+  Added 2026-10-05 because cycles 48–52 deferred every decision for lack of
+  valuation, earnings dates and reported results. Measured cost: ~+40.6k prompt
+  tokens (~$0.16/cycle) and ~2.5 min per cycle (Finnhub's free tier, 144 calls at
+  55/min); the estimate had been 12k, and the operator chose to keep every field
+  over a 20k cap. The SEC's structured data can lag a 10-Q by months (GD's
+  2026-07-29 10-Q was absent on 2026-10-05); this is named as
+  `newer_filing_not_yet_in_sec_data`, and Finnhub's EPS actuals arrive faster.
+  BRK.B's estimates are filed under BRK.A (per Class A share) and are withheld.
 
 The record exists because position weight is a lossy encoding of history, and
 re-deriving intent from it produces two specific failures, both observed:
@@ -386,7 +399,8 @@ separate code path — keep it that way. Use `venv/bin/python`; `run_daily.sh`
 does.
 
 Secrets come from `.env` (see `.env.example`): `ANTHROPIC_API_KEY`,
-`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER`. Note `ALPACA_PAPER` is
+`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER`, `FINNHUB_API_KEY`,
+`SEC_USER_AGENT` (the SEC requires contact details in it). Note `ALPACA_PAPER` is
 present but **not read by any code** — the mode flag decides.
 
 `agent.py` and `dashboard.py` hit the broker and the Anthropic API and write
@@ -396,6 +410,7 @@ rows; only `report.py` is safe to run casually.
 
 - Tech stack lists Pandas/NumPy, yfinance, Alpha Vantage and a separate news
   API. None are used. Dependencies are exactly `alpaca-py`, `anthropic`,
-  `python-dotenv`; prices, SPY closes, and news all come from Alpaca.
+  `python-dotenv`. Prices, SPY closes and news come from Alpaca; fundamentals
+  from Finnhub (free tier) and SEC EDGAR, over stdlib HTTP.
 - Scheduling is launchd, not cron or GitHub Actions.
 - Phase 3 ("performance dashboard vs. SPY") is already built — `dashboard.py`.
