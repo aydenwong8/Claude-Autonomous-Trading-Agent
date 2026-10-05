@@ -365,3 +365,87 @@ def test_prune_removes_only_stale_cache_files(tmp_path):
     os.utime(tickers, (now - 99 * 86_400,) * 2)
     assert edgar.prune(now) == 1
     assert not old.exists() and fresh.exists() and tickers.exists()
+
+
+# --- review fixes: one bad payload must not blank the feed --------------------
+
+
+@pytest.mark.parametrize("needle, payload", [
+    ("/stock/earnings", {"error": "unexpected"}),          # history as a dict
+    ("/calendar/earnings", {"earningsCalendar": {"x": 1}}),  # calendar rows as a dict
+    ("/stock/metric", ["not", "a", "dict"]),                # metrics as a list
+    ("/stock/metric", {"metric": {"peTTM": "n/a"}}),        # a number that isn't
+])
+def test_malformed_finnhub_payload_flags_only_that_name(tmp_path, needle, payload):
+    class Odd(FakeGet):
+        def __call__(self, url, headers, limiter):
+            if needle in url and "symbol=GD" in url:
+                self.urls.append(url)
+                return payload
+            return super().__call__(url, headers, limiter)
+
+    out = blocks(tmp_path, symbols=("GD", "JPM"), get=Odd())[0]
+    assert out["GD"]["lookup_failed"] == {"finnhub": "unexpected response shape"}
+    assert out["GD"]["reported_results"]["revenue_usd_bn"] == 13.48  # EDGAR still shown
+    assert "lookup_failed" not in out["JPM"]
+
+
+def test_mismatched_sec_lists_flag_only_that_name(tmp_path):
+    class Ragged(FakeGet):
+        def __call__(self, url, headers, limiter):
+            if "submissions" in url and "CIK0000040533" in url:
+                self.urls.append(url)
+                return {"filings": {"recent": {"form": ["8-K", "8-K"], "filingDate": ["2026-09-01"],
+                        "accessionNumber": ["a"], "items": [""], "acceptanceDateTime": [None]}}}
+            return super().__call__(url, headers, limiter)
+
+    out = blocks(tmp_path, symbols=("GD", "JPM"), get=Ragged())[0]
+    assert out["GD"]["lookup_failed"] == {"edgar": "unexpected response shape"}
+    assert "lookup_failed" not in out["JPM"]
+
+
+def test_truncated_body_is_a_lookup_failure():
+    import http.client
+    with pytest.raises(f.LookupFailed, match="IncompleteRead"):
+        get_json([http.client.IncompleteRead(b""), http.client.IncompleteRead(b"")])
+
+
+@pytest.mark.parametrize("header, waited", [
+    ("Wed, 21 Oct 2026 07:28:00 GMT", 2.0),  # an HTTP-date: fall back to the default
+    ("3600", 60.0),                          # capped, so one 429 can't stall the cycle
+])
+def test_retry_after_is_parsed_defensively(header, waited):
+    sleeps = []
+    result, _ = get_json([http_error(429, header), b"{}"], sleeps)
+    assert result == {} and sleeps == [waited]
+
+
+def test_a_10k_without_quarterly_figures_is_named():
+    # Q3 from a 10-Q; then the 10-K, which carries only the full year.
+    def fact(start, end, form, accn, val):
+        return {"start": start, "end": end, "form": form, "accn": accn,
+                "filed": "2026-02-10" if form == "10-K" else "2025-10-28", "val": val}
+    facts = {"facts": {"us-gaap": {"Revenues": {"units": {"USD": [
+        fact("2025-07-01", "2025-09-30", "10-Q", "q3", 10e9),
+        fact("2025-01-01", "2025-12-31", "10-K", "k", 41e9),
+    ]}}}}}
+    missing = []
+    out = f.reported_results_block(
+        facts, missing, {"form": "10-K", "filed": "2026-02-10", "accession": "k"})
+    assert out["source"] == "10-Q, quarter ended 2025-09-30, filed 2025-10-28"
+    assert out["newer_filing_not_yet_in_sec_data"] == (
+        "10-K filed 2026-02-10 (it reports the full year, with no separate quarter)")
+
+
+def test_a_10q_whose_figures_are_missing_is_named_without_the_10k_wording():
+    facts = {"facts": {"us-gaap": {"Revenues": {"units": {"USD": [
+        {"start": "2026-01-01", "end": "2026-03-31", "form": "10-Q", "accn": "q1",
+         "filed": "2026-04-28", "val": 1e9},
+        # The newest quarter's figure, but carried under an older accession:
+        {"start": "2026-04-01", "end": "2026-06-30", "form": "10-Q", "accn": "q1",
+         "filed": "2026-07-28", "val": 2e9},
+    ]}}, "DocumentType": {"units": {"pure": [{"accn": "q2b", "form": "10-Q"}]}}}}}
+    out = f.reported_results_block(
+        facts, [], {"form": "10-Q", "filed": "2026-07-28", "accession": "q2b"})
+    assert out["newer_filing_not_yet_in_sec_data"] == (
+        "10-Q filed 2026-07-28 (its quarterly figures are not in the SEC's data yet)")

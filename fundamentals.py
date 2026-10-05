@@ -19,6 +19,7 @@ report" when it means "not looked up".
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import statistics
@@ -77,6 +78,8 @@ EIGHT_K_ITEMS = {
     "9.01": "Financial statements and exhibits",
 }
 EARNINGS_HOURS = {"bmo": "before open", "amc": "after close"}
+# What a response of the wrong shape raises while being parsed.
+PARSE_ERRORS = (KeyError, TypeError, AttributeError, ValueError, IndexError)
 
 
 class LookupFailed(Exception):
@@ -127,11 +130,21 @@ def http_get_json(
                 raise LookupFailed("not found (HTTP 404)") from None
             reason = f"HTTP {e.code}"
             if e.code == 429 and attempt == 0:
-                sleep(float(e.headers.get("Retry-After") or 2))
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            # URLError is an OSError; ValueError covers malformed JSON.
+                sleep(_retry_after(e.headers.get("Retry-After")))
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+            # URLError is an OSError; ValueError covers malformed JSON;
+            # HTTPException covers a truncated body (IncompleteRead).
             reason = type(e).__name__
     raise LookupFailed(reason)
+
+
+def _retry_after(value: str | None) -> float:
+    """Seconds to wait after a 429. The header may also be an HTTP-date, and
+    is capped so one rate-limit reply cannot stall the cycle."""
+    try:
+        return min(max(float(value), 0.0), 60.0)
+    except (TypeError, ValueError):
+        return 2.0
 
 
 class FinnhubClient:
@@ -448,6 +461,17 @@ def reported_results_block(
         out["newer_filing_not_yet_in_sec_data"] = (
             f"{latest_report['form']} filed {latest_report['filed']}"
         )
+    elif latest_report and anchor.get("accn") != latest_report["accession"]:
+        # The filing is in the data but the quarter shown is not from it. For a
+        # 10-K that is normal: it reports the full year with no separate fourth
+        # quarter, so from February to the Q1 10-Q the newest quarter is two
+        # reports old.
+        why = ("it reports the full year, with no separate quarter"
+               if latest_report["form"].startswith("10-K")
+               else "its quarterly figures are not in the SEC's data yet")
+        out["newer_filing_not_yet_in_sec_data"] = (
+            f"{latest_report['form']} filed {latest_report['filed']} ({why})"
+        )
     return out
 
 
@@ -540,12 +564,22 @@ def symbol_block(
                 calendar = result
             else:
                 history = result
-        if metric is not None:
-            block["valuation"] = valuation_block(metric, missing)
-            block["growth_and_quality"] = growth_block(metric, missing)
-        earnings = earnings_block(symbol, calendar, history, today, missing)
-        if earnings:
-            block["earnings"] = earnings
+        # Parsed into locals first, so a malformed payload flags this name's
+        # Finnhub data instead of escaping and blanking every name's block.
+        parsed: dict[str, Any] = {}
+        noted: list[str] = []
+        try:
+            if metric is not None:
+                parsed["valuation"] = valuation_block(metric, noted)
+                parsed["growth_and_quality"] = growth_block(metric, noted)
+            earnings = earnings_block(symbol, calendar, history, today, noted)
+            if earnings:
+                parsed["earnings"] = earnings
+        except PARSE_ERRORS:
+            problems = ["unexpected response shape"]
+        else:
+            block.update(parsed)
+            missing.extend(noted)
         if problems:
             failed["finnhub"] = "; ".join(problems)
 
@@ -561,7 +595,7 @@ def symbol_block(
             block["material_filings_90d"] = material_filings(submissions, today, last_cycle_at)
         except LookupFailed as e:
             failed["edgar"] = str(e)
-        except (KeyError, TypeError, AttributeError, ValueError):
+        except PARSE_ERRORS:
             failed["edgar"] = "unexpected response shape"
 
     if missing:
