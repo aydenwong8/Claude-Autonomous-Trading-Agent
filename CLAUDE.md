@@ -6,12 +6,12 @@ Guidance for Claude Code (claude.ai/code) working in this repository.
 
 Implemented and running. The full five-stage pipeline exists and executes
 automatically on weekdays against an Alpaca **paper** account (Phase 1 of the
-rollout in README.md). Through 2026-09-30 the DB holds 50 decision cycles and 12
-open theses, none ever closed. Nothing runs against live money, and Phase 2
-(live) is deferred with no date — there is no plan to go live soon.
+rollout in README.md). Nothing runs against live money, and Phase 2 (live) is
+deferred with no date — there is no plan to go live soon. For current counts
+(cycles, theses, trades), query `trading_agent.db` rather than trusting any
+figure written here.
 
-README.md is the original design doc and is now partly stale — where it and the
-code disagree, **the code wins**. Known divergences are flagged below.
+README.md is the design doc — where it and the code disagree, **the code wins**.
 
 ## What this project is
 
@@ -41,7 +41,6 @@ inputs and the plumbing, not its individual decisions.
 | `theses.py` | Open theses, action history (`fetch_action_history`), the thesis lifecycle, orphan cleanup. |
 | `db.py` | Schema, migrations, run/cycle logging, prompt log. |
 | `fundamentals.py` | Finnhub + SEC EDGAR facts per name: valuation against its own 5-year history, earnings dates with consensus, the last 4 quarters' EPS against estimate, the latest reported quarter, material filings. Never raises; failures become per-name `lookup_failed`. Cache in `cache/edgar/` (gitignored, pruned after 30 days). |
-| `tools/split_agent.py` | One-off script that performed the 2026-10 split of `agent.py`; kept for the record. |
 | `config.py` | Guardrail thresholds, `CLAUDE_MODEL` / `CLAUDE_MAX_TOKENS`, `VALID_EXIT_TRIGGERS`, and `WATCHLIST` (S&P 1500 ∪ Nasdaq-100 plus SPY/QQQ, ~1,500 symbols, snapshotted 2026-08-05 — index membership drifts, refresh occasionally). |
 | `markettime.py` | Store UTC, display Eastern. Every display boundary — console, dashboard, report, *and the prompt Claude reads* — converts through here. Do not format timestamps ad hoc elsewhere. |
 | `dashboard.py` | Reads Alpaca + the DB, writes a self-contained `dashboard.html` (agent equity curve vs. buy-and-hold SPY, holdings, risk stats, decision log). No server, no external requests at view time. |
@@ -74,9 +73,8 @@ whenever the prompt is meant to change**, e.g. new data in the prompt.
 tracks the 16:00 ET close through DST without adjustment. stdout/stderr go to
 `logs/agent.log`; `RunAtLoad` is false.
 
-**Discrepancy:** README.md still says "weekly decision cycle (avoids PDT rules
-on accounts < $25k)". The implementation runs **daily** post-close. The PDT
-rationale is not enforced anywhere in code — the mitigation is now behavioral
+**PDT is not enforced in code.** The cycle runs daily, and the mitigation for
+pattern-day-trader rules on accounts under $25k is behavioral
 (the system prompt tells Claude it is a swing investor and that most days the
 correct output is zero trades), not structural. If the account ever goes live
 under $25k, this needs a real look.
@@ -101,9 +99,9 @@ broker rejects the duplicate. The rejection is recorded as
 `submit_failed:` — one means the fill already exists, the other that it never
 happened.
 
-## Thesis lifecycle and exit triggers (not in README)
+## Thesis lifecycle and exit triggers
 
-This is the core behavioral design and has no README coverage.
+This is the core behavioral design. README.md summarises it; the detail is here.
 
 - **Buys must open a written case**: `thesis` (why we own it), `target` (what
   playing out looks like), `invalidation` (what would prove it wrong).
@@ -258,12 +256,14 @@ fails any of these must be **rejected and logged, never silently adjusted**.
 Plus two structural rules with the same standing: buys require
 thesis/target/invalidation, sells require a valid `exit_trigger`.
 
-**Nothing here has ever fired.** Across the first 28 cycles, 21 of 21 proposed
-trades passed validation and zero were rejected. The binding constraint on this
-agent is not the guardrails, it is inertia: 20 of 28 cycles proposed no trades,
-verdicts ran 244 `hold` / 6 `trim` / 0 `exit`, and no thesis has ever been
-closed — so the exit path is untested in production. Before adding a rule here,
-check `trades.rejection_reason` for evidence the existing set is doing anything.
+**Nothing here has ever fired.** As of 2026-10-05 (53 cycles), 0 of 34 proposed
+trades were rejected. The binding constraint on this agent is not the
+guardrails, it is inertia: 30 of 53 cycles proposed no trades, verdicts ran 520
+`hold` / 12 `trim` / 0 `exit`, and no thesis has ever been closed — so the exit
+path is untested in production. Before adding a rule here, re-check against the
+DB (`select count(*), sum(is_valid=0) from trades`; `select verdict, count(*)
+from position_reviews group by 1`) for evidence the existing set is doing
+anything.
 
 Validation runs cumulatively across the proposed list (running cash and running
 position values), so trade N is checked against the state trades 1..N-1 would
@@ -399,18 +399,16 @@ separate code path — keep it that way. Use `venv/bin/python`; `run_daily.sh`
 does.
 
 Secrets come from `.env` (see `.env.example`): `ANTHROPIC_API_KEY`,
-`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER`, `FINNHUB_API_KEY`,
-`SEC_USER_AGENT` (the SEC requires contact details in it). Note `ALPACA_PAPER` is
-present but **not read by any code** — the mode flag decides.
+`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `FINNHUB_API_KEY`, `SEC_USER_AGENT` (the
+SEC requires contact details in it). There is no paper/live setting in `.env` —
+the mode flag decides, and live is further locked behind
+`config.LIVE_UNLOCK_ENV`.
 
 `agent.py` and `dashboard.py` hit the broker and the Anthropic API and write
 rows; only `report.py` is safe to run casually.
 
-## Other README divergences worth knowing
+## Dependencies and data sources
 
-- Tech stack lists Pandas/NumPy, yfinance, Alpha Vantage and a separate news
-  API. None are used. Dependencies are exactly `alpaca-py`, `anthropic`,
-  `python-dotenv`. Prices, SPY closes and news come from Alpaca; fundamentals
-  from Finnhub (free tier) and SEC EDGAR, over stdlib HTTP.
-- Scheduling is launchd, not cron or GitHub Actions.
-- Phase 3 ("performance dashboard vs. SPY") is already built — `dashboard.py`.
+Runtime dependencies are exactly `alpaca-py`, `anthropic`, `python-dotenv`
+(`pytest` and `pyflakes` are dev-only). Prices, SPY closes and news come from
+Alpaca; fundamentals from Finnhub (free tier) and SEC EDGAR, over stdlib HTTP.
