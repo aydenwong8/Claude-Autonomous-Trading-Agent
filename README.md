@@ -62,9 +62,9 @@ is a numeric comparison, and comparisons against `NaN` are always false, so such
 value would otherwise satisfy all of them.
 
 **Trade frequency.** The agent runs once daily after the close, not weekly as originally
-designed. Nothing in code enforces a trade-frequency limit; "most days should be zero
-trades" is instruction to the model, not a guardrail — the one advisory rule in an
-otherwise code-enforced set. The PDT rule this was originally meant to guard against
+designed. Nothing in code enforces a trade-frequency limit, and the prompt no longer
+advises one either: "most days should be zero trades" was removed on 2026-10-08, so
+how often to trade is the agent's own call. The PDT rule that line was originally meant to guard against
 cannot actually bind: pattern-day-trading counts same-session round trips, and an agent
 that decides once after the close and holds overnight has no way to make one. The real
 observed risk runs the other way — see below.

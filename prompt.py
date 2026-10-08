@@ -321,7 +321,7 @@ Respond with ONLY a single JSON object (no prose, no markdown fences) matching t
 }
 Buys REQUIRE thesis, target, and invalidation. Sells REQUIRE exit_trigger. Trades \
 missing these fields are rejected by code before reaching the broker.
-"trades" may be an empty list — and on most days it should be.
+"trades" may be an empty list.
 
 ADOPTING AN UNTRACKED POSITION
 

@@ -75,8 +75,9 @@ tracks the 16:00 ET close through DST without adjustment. stdout/stderr go to
 
 **PDT is not enforced in code.** The cycle runs daily, and the mitigation for
 pattern-day-trader rules on accounts under $25k is behavioral
-(the system prompt tells Claude it is a swing investor and that most days the
-correct output is zero trades), not structural. If the account ever goes live
+(the system prompt tells Claude it is a swing investor, not a daily trader),
+not structural. The prompt no longer says most days should be zero trades —
+that line was removed 2026-10-08 so the agent sets its own trading frequency. If the account ever goes live
 under $25k, this needs a real look.
 
 launchd gives a bare environment with `cwd=/`, which is why `run_daily.sh` uses
