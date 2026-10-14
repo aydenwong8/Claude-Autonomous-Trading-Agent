@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 import statistics
+import time
 from datetime import datetime, timedelta, timezone
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import config
@@ -123,19 +124,7 @@ def _pct_change(now: float, then: float) -> float | None:
     return round((now / then - 1) * 100, 2)
 
 
-def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]] | None:
-    """Momentum, range position, realised volatility and liquidity per symbol.
-
-    Computed from daily bars over `config.SCREEN_LOOKBACK_DAYS`. The whole
-    watchlist costs one paginated request (~26s for 1,519 names), so this runs
-    over everything rather than a pre-filtered subset — the filtering happens
-    in `select_candidates`, which needs the full distribution to rank against.
-
-    A failure here degrades the prompt to positions-only; it must not abort a
-    cycle, because the position reviews and the guardrails do not depend on it.
-    It is retried once, then returns None — distinct from an empty result, so
-    the prompt can say the screen did not run rather than that it found nothing.
-    """
+def _alpaca_daily_bars(symbols: list[str]) -> dict[str, list[Any]]:
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import Adjustment, DataFeed
@@ -154,15 +143,56 @@ def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]] | None
         # instead of a dividend-adjusted figure.
         adjustment=Adjustment.SPLIT,
     )
-    for attempt in (1, 2):
-        try:
-            bars = _data_client().get_stock_bars(request).data
-            break
-        except Exception as exc:
-            if attempt == 2:
-                print(f"  screen: bar fetch failed twice ({exc}) — continuing without candidates")
-                return None
-            print(f"  screen: bar fetch failed ({exc}) — retrying once")
+    return _data_client().get_stock_bars(request).data
+
+
+def fetch_daily_bars(
+    symbols: list[str],
+    get: Callable[[list[str]], dict[str, list[Any]]] = _alpaca_daily_bars,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, list[Any]] | None:
+    """Daily bars for every symbol, fetched in chunks of `config.SCREEN_BAR_CHUNK`.
+
+    Each chunk is retried after each of `config.SCREEN_RETRY_WAITS`, so a
+    connection reset costs one chunk's retry rather than the whole screen. If a
+    chunk still fails, returns None: a screen missing a slice of the universe
+    would rank candidates from part of it while presenting them as the whole.
+    """
+    bars: dict[str, list[Any]] = {}
+    for i in range(0, len(symbols), config.SCREEN_BAR_CHUNK):
+        chunk = symbols[i : i + config.SCREEN_BAR_CHUNK]
+        waits = list(config.SCREEN_RETRY_WAITS)
+        while True:
+            try:
+                bars.update(get(chunk))
+                break
+            except Exception as exc:
+                if not waits:
+                    print(f"  screen: bar fetch failed after {len(config.SCREEN_RETRY_WAITS)} retries ({exc}) — continuing without candidates")
+                    return None
+                wait = waits.pop(0)
+                print(f"  screen: bar fetch failed ({exc}) — retrying in {wait}s")
+                sleep(wait)
+    return bars
+
+
+def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]] | None:
+    """Momentum, range position, realised volatility and liquidity per symbol.
+
+    Computed from daily bars over `config.SCREEN_LOOKBACK_DAYS`. The whole
+    watchlist costs one paginated request (~26s for 1,519 names), so this runs
+    over everything rather than a pre-filtered subset — the filtering happens
+    in `select_candidates`, which needs the full distribution to rank against.
+
+    A failure here degrades the prompt to positions-only; it must not abort a
+    cycle, because the position reviews and the guardrails do not depend on it.
+    If the bars cannot be fetched it returns None — distinct from an empty
+    result, so the prompt can say the screen did not run rather than that it
+    found nothing.
+    """
+    bars = fetch_daily_bars(symbols)
+    if bars is None:
+        return None
 
     stats: dict[str, dict[str, Any]] = {}
     for symbol, series in bars.items():

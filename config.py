@@ -288,6 +288,12 @@ SCREEN_MIN_DOLLAR_VOL_M = 10.0
 # wrong bias when the mandate is risk-adjusted return — the low-volatility bucket
 # exists specifically to counterweight that.
 SCREEN_PER_BUCKET = 10
+# The bar fetch is split into chunks, each retried after these waits (seconds).
+# As one ~1,500-symbol paginated request, a single connection reset anywhere in
+# the pagination threw away every page fetched so far, and the immediate retry
+# hit the same thing: the screen was lost on 2026-09-28, 10-07, 10-09 and 10-12.
+SCREEN_BAR_CHUNK = 200
+SCREEN_RETRY_WAITS = (5, 20, 60)
 
 # --- Storage --------------------------------------------------------------------
 DEFAULT_DB_PATH = "trading_agent.db"
