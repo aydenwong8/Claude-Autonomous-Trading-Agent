@@ -552,6 +552,25 @@ def latest_report(submissions: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
+def _items(recent: dict[str, list[Any]], i: int) -> list[str]:
+    return [c for c in ((recent.get("items") or [""] * (i + 1))[i] or "").split(",") if c]
+
+
+def _filing_line(recent: dict[str, list[Any]], i: int, last_cycle_at: datetime | None) -> str:
+    """"2026-07-29 8-K: 2.02 Results of operations [new since your last cycle]"."""
+    line = f"{recent['filingDate'][i]} {recent['form'][i]}"
+    codes = _items(recent, i)
+    if len(codes) > 1:
+        # 9.01 lists the exhibits; beside a real item it adds nothing.
+        codes = [c for c in codes if c != "9.01"]
+    if codes:
+        line += ": " + "; ".join(f"{c} {EIGHT_K_ITEMS.get(c, '')}".strip() for c in codes)
+    accepted = datetime.fromisoformat(_accepted_at(recent, i).replace("Z", "+00:00"))
+    if last_cycle_at is None or accepted > last_cycle_at:
+        line += " [new since your last cycle]"
+    return line
+
+
 def material_filings(
     submissions: dict[str, Any], today: date, last_cycle_at: datetime | None,
 ) -> list[str]:
@@ -562,20 +581,9 @@ def material_filings(
     cutoff = (today - timedelta(days=config.FILINGS_LOOKBACK_DAYS)).isoformat()
     out = []
     for i, form in enumerate(recent.get("form") or []):
-        filed = recent["filingDate"][i]
-        if form not in MATERIAL_FORMS or filed < cutoff:
+        if form not in MATERIAL_FORMS or recent["filingDate"][i] < cutoff:
             continue
-        line = f"{filed} {form}"
-        codes = [c for c in ((recent.get("items") or [""] * (i + 1))[i] or "").split(",") if c]
-        if len(codes) > 1:
-            # 9.01 lists the exhibits; beside a real item it adds nothing.
-            codes = [c for c in codes if c != "9.01"]
-        if codes:
-            line += ": " + "; ".join(f"{c} {EIGHT_K_ITEMS.get(c, '')}".strip() for c in codes)
-        accepted = datetime.fromisoformat(_accepted_at(recent, i).replace("Z", "+00:00"))
-        if last_cycle_at is None or accepted > last_cycle_at:
-            line += " [new since your last cycle]"
-        out.append(line)
+        out.append(_filing_line(recent, i, last_cycle_at))
     # By date only: the SEC lists newest first, and a stable sort keeps that
     # order within a day (sorting whole lines would put "8-K" after "10-Q").
     return sorted(out, key=lambda line: line[:10], reverse=True)
@@ -706,6 +714,61 @@ def earnings_release_block(
     return block
 
 
+_ITEM_HEADING = re.compile(r"^Item \d+\.\d{2}\b", re.MULTILINE)
+_BODY_END = re.compile(r"^(?:Item 9\.01\b|SIGNATURES?\b)", re.MULTILINE)
+
+
+def eight_k_body(text: str) -> str:
+    """An 8-K's item sections: from the first "Item N.NN" heading to the
+    exhibit list (9.01) or the signature. The cover page before it is the same
+    boilerplate in every filing (~2-4k characters of addresses and checkboxes)."""
+    start = _ITEM_HEADING.search(text)
+    if start is None:
+        return text
+    body = text[start.start():]
+    end = _BODY_END.search(body)
+    return (body[: end.start()] if end else body).rstrip()
+
+
+def recent_8ks(submissions: dict[str, Any], today: date) -> list[dict[str, Any]]:
+    """8-Ks within EIGHT_K_TEXT_DAYS, newest first, at most EIGHT_K_TEXT_MAX_FILINGS.
+    Results 8-Ks (item 2.02) are left out: earnings_release covers them."""
+    recent = (submissions.get("filings") or {}).get("recent") or {}
+    cutoff = (today - timedelta(days=config.EIGHT_K_TEXT_DAYS)).isoformat()
+    picked = []
+    for i, form in enumerate(recent.get("form") or []):
+        if recent["filingDate"][i] < cutoff:
+            break  # newest first: nothing older can qualify
+        if form in ("8-K", "8-K/A") and "2.02" not in _items(recent, i):
+            picked.append({"index": i, "accession": recent["accessionNumber"][i],
+                           "document": recent["primaryDocument"][i]})
+            if len(picked) == config.EIGHT_K_TEXT_MAX_FILINGS:
+                break
+    return picked
+
+
+def eight_k_text_block(
+    edgar: EdgarClient, cik: int, submissions: dict[str, Any], today: date,
+    last_cycle_at: datetime | None,
+) -> list[dict[str, Any]]:
+    """One entry per recent 8-K: its filing line (as in material_filings_90d)
+    and item text. A document that cannot be read is flagged in its own entry."""
+    recent = submissions["filings"]["recent"]
+    entries = []
+    for filing in recent_8ks(submissions, today):
+        entry: dict[str, Any] = {"filing": _filing_line(recent, filing["index"], last_cycle_at)}
+        try:
+            text = edgar.document_text(cik, filing["accession"], filing["document"])
+        except LookupFailed as e:
+            entry["lookup_failed"] = str(e)
+        else:
+            entry["text"], note = _cap(eight_k_body(text), config.EIGHT_K_MAX_CHARS)
+            if note:
+                entry["truncated"] = note
+        entries.append(entry)
+    return entries
+
+
 def _put(out: dict[str, Any], missing: list[str], key: str, value: Any) -> None:
     if value is None:
         missing.append(key)
@@ -723,11 +786,12 @@ def symbol_block(
     today: date,
     last_cycle_at: datetime | None,
     unavailable: dict[str, str],
-    with_release: bool = False,
+    held: bool = False,
 ) -> dict[str, Any]:
     """One name's block. `unavailable` names sources that cannot be called at
-    all this cycle (e.g. no API key), with the reason to show. `with_release`
-    adds the latest earnings release (holdings only: ~2k tokens each)."""
+    all this cycle (e.g. no API key), with the reason to show. `held` adds the
+    filed documents themselves: the latest earnings release and recent 8-Ks'
+    item text (holdings only: a few thousand tokens each)."""
     if symbol in FUND_SYMBOLS:
         return {"not_applicable": "fund: no company financials or earnings"}
     block: dict[str, Any] = {}
@@ -788,7 +852,7 @@ def symbol_block(
             failed["edgar"] = "unexpected response shape"
         else:
             # Its own failure, so an unreadable exhibit costs only the release.
-            if with_release:
+            if held:
                 try:
                     release = earnings_release_block(edgar, cik, submissions, today, last_cycle_at)
                     if release:
@@ -797,6 +861,12 @@ def symbol_block(
                     failed["earnings_release"] = str(e)
                 except PARSE_ERRORS:
                     failed["earnings_release"] = "unexpected response shape"
+                try:
+                    eight_ks = eight_k_text_block(edgar, cik, submissions, today, last_cycle_at)
+                    if eight_ks:
+                        block["recent_8k_text"] = eight_ks
+                except PARSE_ERRORS:
+                    failed["recent_8k_text"] = "unexpected response shape"
 
     if missing:
         block["not_available"] = missing
@@ -811,11 +881,11 @@ def fetch_fundamentals(
     now: datetime,
     finnhub: FinnhubClient | None = None,
     edgar: EdgarClient | None = None,
-    release_for: frozenset[str] | set[str] = frozenset(),
+    held: frozenset[str] | set[str] = frozenset(),
 ) -> dict[str, dict[str, Any]]:
     """Blocks for every symbol, keyed by symbol. Clients are built from the
-    environment unless passed in (tests pass fakes). Names in `release_for`
-    also get their latest earnings release."""
+    environment unless passed in (tests pass fakes). Names in `held` also get
+    their filed documents (see symbol_block)."""
     today = date.fromisoformat(markettime.fmt_et_date(now))
     unavailable: dict[str, str] = {}
     if finnhub is None:
@@ -837,7 +907,7 @@ def fetch_fundamentals(
         print(f"warning: fundamentals: {source} unavailable ({reason})")
     blocks = {
         s: symbol_block(s, finnhub, edgar, today, last_cycle_at, unavailable,
-                        with_release=s in release_for)
+                        held=s in held)
         for s in symbols
     }
     if edgar is not None:

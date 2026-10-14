@@ -216,7 +216,14 @@ put in the prompt deliberately. Three things are, plus one fact feed:
   one (MedTech +2.5%; $2.2B net charge-offs, $539M reserve build). Filing
   indexes and converted documents are cached under `cache/edgar/docs/` (they
   never change) and pruned with the rest. `test_earnings_release.py` runs on
-  JNJ's real recorded exhibit.
+  JNJ's real recorded exhibit. Holdings also get `recent_8k_text`: the item
+  text of up to 3 non-results 8-Ks from the last 30 days (cover page, 9.01
+  exhibit list and signature cut; ≤3,000 characters each), because the
+  one-line filing list left IQV's 23 Sep debt 8-K an open question for three
+  weeks when the filing says it refinances existing notes. Exhibits are not
+  followed, so a 7.01 that only points to slides says little. ~3k tokens on
+  the 2026-10-14 book. Both document feeds are gated by `held` in
+  `fetch_fundamentals` / `symbol_block`; candidates get neither.
 
 The record exists because position weight is a lossy encoding of history, and
 re-deriving intent from it produces two specific failures, both observed:

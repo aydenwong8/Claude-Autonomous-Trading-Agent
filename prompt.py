@@ -237,6 +237,12 @@ each cycle from two sources:
   results, credit costs, one-off items and guidance are stated, which the EPS \
   figures above do not show. It is the company describing its own quarter, so \
   read its emphasis with that in mind; "truncated" means only the opening is shown.
+- "recent_8k_text" (EDGAR, holdings only): for up to three 8-Ks from the last 30 \
+  days other than the results one, the filing line as it appears in \
+  "material_filings_90d" and the text of its items (cover page, exhibit list and \
+  signature removed). This is what the filing actually says, e.g. what new debt \
+  is for or who an officer change involves. Where an item only points to an \
+  attached exhibit, the exhibit itself is not shown.
 
 "not_available" names figures the source does not provide for that company (banks, \
 for example, report no operating margin). "not_applicable" marks funds, which have \

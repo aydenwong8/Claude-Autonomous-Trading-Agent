@@ -136,7 +136,7 @@ def fundamentals_for(conn, portfolio, market, now: datetime) -> dict[str, dict]:
     last_cycle_at = datetime.fromisoformat(last) if last else None
     try:
         blocks = fetch_fundamentals(symbols, last_cycle_at, now,
-                                    release_for=set(portfolio.positions))
+                                    held=set(portfolio.positions))
     except Exception:
         traceback.print_exc()
         return {s: {"lookup_failed": {"fundamentals": "internal error"}} for s in symbols}

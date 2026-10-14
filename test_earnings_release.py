@@ -167,7 +167,7 @@ class JnjOnly:
 
 def test_release_attaches_only_when_asked_for(tmp_path):
     client = JnjOnly(tmp_path, FakeSec())
-    held = f.symbol_block("JNJ", None, client, TODAY, LAST_CYCLE, {}, with_release=True)
+    held = f.symbol_block("JNJ", None, client, TODAY, LAST_CYCLE, {}, held=True)
     candidate = f.symbol_block("JNJ", None, client, TODAY, LAST_CYCLE, {})
     assert "MedTech" in held["earnings_release"]["text"]
     assert "earnings_release" not in candidate
@@ -175,7 +175,7 @@ def test_release_attaches_only_when_asked_for(tmp_path):
 
 def test_a_failed_release_fetch_keeps_the_filings(tmp_path):
     client = JnjOnly(tmp_path, FakeSec(fail_text=True))
-    block = f.symbol_block("JNJ", None, client, TODAY, LAST_CYCLE, {}, with_release=True)
+    block = f.symbol_block("JNJ", None, client, TODAY, LAST_CYCLE, {}, held=True)
     assert block["lookup_failed"] == {"earnings_release": "HTTP 503"}
     assert block["material_filings_90d"][0].startswith("2026-10-13 8-K: 2.02")
     assert "earnings_release" not in block

@@ -317,3 +317,9 @@ EARNINGS_LOOKAHEAD_DAYS = 120
 # guidance in both JNJ's and JPM's 2026-10-13 releases (16.6k and 24k in full).
 EARNINGS_RELEASE_DAYS = 21
 EARNINGS_RELEASE_MAX_CHARS = 8_000
+# Holdings also get the item text of their other 8-Ks from this window. Item
+# bodies run ~1.5-3k characters once the cover page is cut (IQV's 23 Sep debt
+# 8-K: 1.8k; ETN's 5 Oct officer change: 2.7k).
+EIGHT_K_TEXT_DAYS = 30
+EIGHT_K_TEXT_MAX_FILINGS = 3
+EIGHT_K_MAX_CHARS = 3_000
