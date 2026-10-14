@@ -193,7 +193,16 @@ put in the prompt deliberately. Three things are, plus one fact feed:
   case for a name not held was the price table. Measured with `count_tokens` on
   2026-09-22 against cycle 44: +4.1k tokens for holdings' news, +4.8k for
   candidates', +0.5k for dating the market sample, +0.5k of system prompt —
-  ~10k in all, about $0.05 a cycle. Share-class tickers are queried by base symbol
+  ~10k in all, about $0.05 a cycle. Every screen row also carries
+  `steepest_5d_fall_since_high_pct` / `_window` (worst 5-session drop after the
+  52-week high), and candidates at least 25% below their high get
+  `news_around_steepest_fall` (`fetch_drawdown_news`): up to 5 dated headlines
+  from that window through the day after, fetched and archived each cycle.
+  Added 2026-10-14 because the agent passed on BSX, INTU, FICO and CHTR saying
+  it "was not given the cause": the falls were months old, so the newest 30
+  days of headlines could not say. On that day's book it reached 12 of 31
+  candidates, ~1.6k tokens, plus ~0.75k for the screen fields.
+  Share-class tickers are queried by base symbol
   (`_news_symbol`: `BRK.B` → `BRK`) because the feed tags `BRK` / `BRK/A` /
   `BRK/B` and never `BRK.B` — until 2026-09-22 every BRK.B lookup returned
   nothing, and the prompt presented that as a complete lookup finding no news
