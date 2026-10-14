@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from collections.abc import Iterable
 from typing import Any
 
@@ -145,6 +145,30 @@ def fetch_candidate_news(
             continue
         rows = _archived_news(conn, symbol, window_start)[: config.NEWS_PER_CANDIDATE]
         out[symbol] = [f"{markettime.fmt_et_date(ts)} — {hl}" for ts, _, hl, _ in rows]
+    return out
+
+
+def fetch_drawdown_news(
+    conn: sqlite3.Connection,
+    windows: dict[str, tuple[str, str]],
+    lookup_failed: set[str] = frozenset(),
+) -> dict[str, dict[str, Any]]:
+    """Dated headlines from each deep-drawdown candidate's steepest fall, from
+    the archive: the window's dates through the day after it ends, newest first.
+
+    The cause of a fall months ago is not in the newest 30 days of headlines,
+    and that cause is what decides whether the name is broken or mispriced.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for symbol, (start, end) in sorted(windows.items()):
+        if symbol in lookup_failed:
+            headlines = ["(news lookup for this window failed today — no information either way)"]
+        else:
+            until = (date.fromisoformat(end) + timedelta(days=2)).isoformat()
+            rows = [r for r in _archived_news(conn, symbol, start) if r[0] < until]
+            headlines = [f"{markettime.fmt_et_date(ts)} — {hl}"
+                         for ts, _, hl, _ in rows[: config.DRAWDOWN_NEWS_SHOWN]]
+        out[symbol] = {"window": f"{start} to {end}", "headlines": headlines}
     return out
 
 

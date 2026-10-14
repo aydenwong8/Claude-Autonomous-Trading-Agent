@@ -259,6 +259,13 @@ NEWS_SUMMARY_CHARS = 240
 # headlines shown. ~30 candidates x 3 headlines is ~6k prompt tokens.
 NEWS_FETCH_PER_CANDIDATE = 10
 NEWS_PER_CANDIDATE = 3
+# Candidates at least this far below their 52-week high also get the news from
+# their steepest 5-session fall since it. Their newest headlines are usually
+# weeks after the fall: the agent passed on BSX (-60%), INTU (-57%), FICO and
+# CHTR on 2026-10-13/14 saying it was not given the cause.
+DRAWDOWN_FROM_HIGH_PCT = -25.0
+DRAWDOWN_NEWS_FETCH = 15
+DRAWDOWN_NEWS_SHOWN = 5
 # Broad market sweep across the watchlist. This is a sample, not per-symbol
 # coverage — at watchlist scale no article budget makes it complete.
 MARKET_NEWS_ARTICLES = 40

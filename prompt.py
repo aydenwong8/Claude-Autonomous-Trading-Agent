@@ -201,6 +201,13 @@ there so you can see whether something is happening in the business behind the p
 move — a headline is a lead to weigh, not a case, and three headlines are not \
 coverage of a company.
 
+"steepest_5d_fall_since_high_pct" and "steepest_5d_fall_window" give the worst \
+5-session drop since the 52-week high and the dates it ran between. A candidate at \
+least 25% below its high also carries "news_around_steepest_fall": dated headlines \
+from that window through the day after it, since the cause of a fall months ago is \
+not in the latest headlines. It is the news from when the price fell, which may or \
+may not be why it fell; a steady slide with no single event can show nothing useful.
+
 What this list is NOT: a buy list, a ranking, or a research report. These are price \
 statistics. They tell you what has happened, never why, and momentum is not a thesis \
 — a name near its 52-week low is either broken or mispriced and nothing here tells \
@@ -354,6 +361,7 @@ def build_decision_prompt(
     candidate_news: dict[str, list[str]],
     as_of: datetime,
     fundamentals: dict[str, dict[str, Any]] | None = None,
+    drawdown_news: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Assemble the prompt sent to Claude, instructing it to return trades as
     structured JSON with written reasoning per trade.
@@ -504,6 +512,8 @@ def build_decision_prompt(
                 **market.screen[s],
                 **({"fundamentals": fundamentals[s]} if fundamentals and s in fundamentals else {}),
                 **({"recent_news": candidate_news[s]} if s in candidate_news else {}),
+                **({"news_around_steepest_fall": drawdown_news[s]}
+                   if drawdown_news and s in drawdown_news else {}),
                 **({"your_track_record": actions[s]} if s in actions else {}),
             }
             for s in market.candidates

@@ -53,6 +53,7 @@ from news import (  # re-exported: agent.X must keep working
     _clip,
     _archived_news,
     fetch_candidate_news,
+    fetch_drawdown_news,
     fetch_news_history,
 )
 from screen import (  # re-exported: agent.X must keep working
@@ -165,12 +166,15 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         candidate_news = fetch_candidate_news(
             conn, market.candidates, now, market.news_lookup_failed,
         )
+        drawdown_news = fetch_drawdown_news(
+            conn, market.drawdown_windows, market.drawdown_lookup_failed,
+        )
         theses = fetch_open_theses(conn)
         actions = fetch_action_history(conn)
         fundamentals = fundamentals_for(conn, portfolio, market, now)
         prompt = build_decision_prompt(
             portfolio, market, theses, actions, news_history, candidate_news, now,
-            fundamentals,
+            fundamentals, drawdown_news,
         )
         trades, reviews, raw_response, usage = get_claude_decision(prompt)
         validated = validate_trades(trades, portfolio, mode)

@@ -110,6 +110,11 @@ class MarketContext:
     # connection reset produced `"candidates": []`, which the model read as a
     # screen that found nothing worth considering.
     screen_failed: bool = False
+    # Candidates far below their high, mapped to the (start, end) dates of their
+    # steepest 5-session fall since it; their news from that window is archived
+    # this cycle. Lookups that failed are named, so the prompt can say so.
+    drawdown_windows: dict[str, tuple[str, str]] = field(default_factory=dict)
+    drawdown_lookup_failed: set[str] = field(default_factory=set)
 
 
 @dataclass

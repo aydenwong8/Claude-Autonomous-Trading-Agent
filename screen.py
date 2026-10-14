@@ -105,6 +105,12 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
                 a.symbols.append(symbol)
         articles.extend(fetched)
 
+    # Deep-drawdown candidates also get the news from when they fell, which
+    # the 30-day lookup above misses for anything that fell months ago.
+    windows = drawdown_windows(screen, candidates)
+    fall_articles, fall_failed = fetch_drawdown_articles(news_client, windows)
+    articles.extend(fall_articles)
+
     return MarketContext(
         prices=prices,
         articles=articles,
@@ -114,6 +120,8 @@ def fetch_market_context(watchlist: list[str], portfolio: PortfolioState) -> Mar
         screen=screen,
         candidates=candidates,
         screen_failed=screen_failed,
+        drawdown_windows=windows,
+        drawdown_lookup_failed=fall_failed,
     )
 
 
@@ -176,7 +184,27 @@ def fetch_daily_bars(
     return bars
 
 
-def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]] | None:
+def steepest_fall_since_high(
+    closes: list[float], dates: list[str],
+) -> tuple[float, tuple[str, str]] | None:
+    """The worst 5-session close-to-close change after the highest close, and
+    the dates it ran between. None until there are 5 sessions after the high.
+
+    Only after the high: a fall before it is not part of how the stock got from
+    its high to here, so its news would not explain today's drawdown."""
+    high = closes.index(max(closes))
+    worst: tuple[float, tuple[str, str]] | None = None
+    for i in range(high + 5, len(closes)):
+        change = _pct_change(closes[i], closes[i - 5])
+        if change is not None and change < 0 and (worst is None or change < worst[0]):
+            worst = (round(change, 1), (dates[i - 5], dates[i]))
+    return worst
+
+
+def compute_screen_stats(
+    symbols: list[str],
+    get: Callable[[list[str]], dict[str, list[Any]]] = _alpaca_daily_bars,
+) -> dict[str, dict[str, Any]] | None:
     """Momentum, range position, realised volatility and liquidity per symbol.
 
     Computed from daily bars over `config.SCREEN_LOOKBACK_DAYS`. The whole
@@ -190,7 +218,7 @@ def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]] | None
     result, so the prompt can say the screen did not run rather than that it
     found nothing.
     """
-    bars = fetch_daily_bars(symbols)
+    bars = fetch_daily_bars(symbols, get=get)
     if bars is None:
         return None
 
@@ -221,7 +249,57 @@ def compute_screen_stats(symbols: list[str]) -> dict[str, dict[str, Any]] | None
             "vol_20d_ann": vol,
             "dollar_vol_20d_m": round(statistics.median(volumes[-20:]) * last / 1e6, 1),
         }
+        # Daily bars are stamped at midnight Eastern, which is the same date in UTC.
+        dates = [b.timestamp.astimezone(timezone.utc).date().isoformat() for b in series]
+        fall = steepest_fall_since_high(closes, dates)
+        if fall is not None:
+            stats[symbol]["steepest_5d_fall_since_high_pct"] = fall[0]
+            stats[symbol]["steepest_5d_fall_window"] = f"{fall[1][0]} to {fall[1][1]}"
     return stats
+
+
+def drawdown_windows(
+    stats: dict[str, dict[str, Any]], candidates: Iterable[str],
+) -> dict[str, tuple[str, str]]:
+    """(start, end) dates of the steepest fall, for candidates at least
+    DRAWDOWN_FROM_HIGH_PCT below their high: the names whose decision turns on
+    why they fell, and whose recent headlines are too late to say."""
+    out = {}
+    for symbol in candidates:
+        row = stats.get(symbol) or {}
+        window = row.get("steepest_5d_fall_window")
+        if window and (row.get("from_52w_high") or 0) <= config.DRAWDOWN_FROM_HIGH_PCT:
+            start, end = window.split(" to ")
+            out[symbol] = (start, end)
+    return out
+
+
+def fetch_drawdown_articles(
+    news_client: Any, windows: dict[str, tuple[str, str]],
+) -> tuple[list[NewsArticle], set[str]]:
+    """Each symbol's news from its fall window, tagged with the symbol, and the
+    symbols whose lookup failed. The window runs through the day after the
+    fall ends: a fall that ends on a reaction day is often written up that
+    evening or the next morning."""
+    from alpaca.data.requests import NewsRequest
+
+    articles: list[NewsArticle] = []
+    failed: set[str] = set()
+    for symbol, (start, end) in sorted(windows.items()):
+        fetched = _fetch_articles(news_client, NewsRequest(
+            symbols=_news_symbol(symbol),
+            start=datetime.fromisoformat(start).replace(tzinfo=timezone.utc),
+            end=datetime.fromisoformat(end).replace(tzinfo=timezone.utc) + timedelta(days=2),
+            limit=config.DRAWDOWN_NEWS_FETCH,
+        ))
+        if fetched is None:
+            failed.add(symbol)
+            continue
+        for a in fetched:
+            if symbol not in a.symbols:
+                a.symbols.append(symbol)
+        articles.extend(fetched)
+    return articles, failed
 
 
 def select_candidates(

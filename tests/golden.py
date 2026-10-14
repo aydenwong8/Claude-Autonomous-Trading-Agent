@@ -50,13 +50,16 @@ def build_prompt(db_path: Path, inputs: dict) -> str:
         candidate_news = agent.fetch_candidate_news(
             conn, market.candidates, now, market.news_lookup_failed,
         )
+        drawdown_news = agent.fetch_drawdown_news(
+            conn, market.drawdown_windows, market.drawdown_lookup_failed,
+        )
         theses = agent.fetch_open_theses(conn)
         actions = agent.fetch_action_history(conn)
     finally:
         conn.close()
     return agent.build_decision_prompt(
         portfolio, market, theses, actions, news_history, candidate_news, now,
-        inputs.get("fundamentals"),
+        inputs.get("fundamentals"), drawdown_news,
     )
 
 
