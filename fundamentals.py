@@ -22,12 +22,14 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import statistics
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +40,7 @@ FINNHUB_URL = "https://finnhub.io/api/v1"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+SEC_FILING_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{name}"
 
 # Funds have no company financials at either source. Named explicitly rather
 # than inferred: the watchlist holds exactly these two, and a guess that
@@ -119,12 +122,35 @@ def http_get_json(
 ) -> Any:
     """GET and decode JSON. One retry; a 429 waits for Retry-After first.
     A 404 is final. Raises LookupFailed with a URL-free reason."""
+    return _http_get(url, headers, limiter, json.load, opener, sleep)
+
+
+def http_get_text(
+    url: str,
+    headers: dict[str, str],
+    limiter: RateLimiter,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """GET a document as text, with http_get_json's retry and failure rules."""
+    return _http_get(url, headers, limiter,
+                     lambda r: r.read().decode("utf-8", errors="replace"), opener, sleep)
+
+
+def _http_get(
+    url: str,
+    headers: dict[str, str],
+    limiter: RateLimiter,
+    decode: Callable[[Any], Any],
+    opener: Callable[..., Any],
+    sleep: Callable[[float], None],
+) -> Any:
     reason = "no response"
     for attempt in range(2):
         limiter.wait()
         try:
             with opener(urllib.request.Request(url, headers=headers), timeout=30) as r:
-                return json.load(r)
+                return decode(r)
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 raise LookupFailed("not found (HTTP 404)") from None
@@ -187,12 +213,14 @@ class EdgarClient:
         cache_dir: Path,
         today: date,
         get: Callable[..., Any] = http_get_json,
+        get_text: Callable[..., str] = http_get_text,
     ):
         self.headers = {"User-Agent": user_agent}
         self.limiter = limiter
         self.cache_dir = Path(cache_dir)
         self.today = today
         self.get = get
+        self.get_text = get_text
         self._ciks: dict[str, int] | None = None
 
     def _fetch(self, url: str) -> Any:
@@ -232,15 +260,49 @@ class EdgarClient:
         _write_json(path, {"accession": report_accession, "complete": complete, "facts": facts})
         return facts
 
+    def filing_index(self, cik: int, accession: str) -> dict[str, Any]:
+        # A filing's contents never change once accepted, so this is cached
+        # for as long as it keeps being used, like document_text.
+        path = self.cache_dir / "docs" / f"{accession}-index.json"
+        cached = _read_json(path)
+        if cached is not None:
+            path.touch()
+            return cached
+        index = self._fetch(SEC_FILING_URL.format(
+            cik=cik, accession=accession.replace("-", ""), name="index.json"))
+        _write_json(path, index)
+        return index
+
+    def document_text(self, cik: int, accession: str, name: str) -> str:
+        """A filed document as plain text. Filings never change once accepted,
+        so the converted text is cached by accession and fetched only once."""
+        path = self.cache_dir / "docs" / f"{accession}-{name}.txt"
+        try:
+            text = path.read_text()
+            path.touch()  # in use: keep it out of prune()
+            return text
+        except OSError:
+            pass
+        html = self.get_text(
+            SEC_FILING_URL.format(cik=cik, accession=accession.replace("-", ""), name=name),
+            self.headers, self.limiter,
+        )
+        text = html_to_text(html)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        except OSError:
+            pass
+        return text
 
     def prune(self, now_epoch: float) -> int:
-        """Delete cached companyfacts unused for EDGAR_CACHE_MAX_AGE_DAYS.
+        """Delete cached companyfacts and documents unused for EDGAR_CACHE_MAX_AGE_DAYS.
 
         Candidates rotate daily and each file is ~3.6 MB, so without this the
         cache grows by every name the screen has ever surfaced."""
         cutoff = now_epoch - config.EDGAR_CACHE_MAX_AGE_DAYS * 86_400
         removed = 0
-        for path in self.cache_dir.glob("CIK*.json"):
+        for path in [*self.cache_dir.glob("CIK*.json"), *self.cache_dir.glob("docs/*")]:
             try:
                 if path.stat().st_mtime < cutoff:
                     path.unlink()
@@ -519,6 +581,131 @@ def material_filings(
     return sorted(out, key=lambda line: line[:10], reverse=True)
 
 
+class _TextExtractor(HTMLParser):
+    """Filed HTML as lines: a table row on one line with its non-empty cells
+    joined by " | ", other blocks a line each. Filings lay out every figure in
+    tables, and one cell per line (or the empty spacer cells kept) roughly
+    doubled the size of a release without adding a figure."""
+
+    BLOCKS = frozenset({"p", "div", "br", "li", "h1", "h2", "h3", "h4", "table"})
+    SKIP = frozenset({"script", "style"})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+        self.text: list[str] = []
+        self.row: list[str] | None = None
+        self.cell: list[str] | None = None
+        self.skipping = 0
+
+    def _flush(self) -> None:
+        line = " ".join("".join(self.text).split())
+        if line:
+            self.lines.append(line)
+        self.text = []
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag in self.SKIP:
+            self.skipping += 1
+        elif tag == "tr":
+            self._flush()
+            self.row = []
+        elif tag in ("td", "th"):
+            self.cell = []
+        elif tag in self.BLOCKS and self.cell is None:
+            self._flush()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.SKIP:
+            self.skipping = max(self.skipping - 1, 0)
+        elif tag in ("td", "th") and self.cell is not None:
+            cell = " ".join("".join(self.cell).split())
+            if cell and self.row is not None:
+                self.row.append(cell)
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            if self.row:
+                self.lines.append(" | ".join(self.row))
+            self.row = None
+        elif tag in self.BLOCKS and self.cell is None:
+            self._flush()
+
+    def handle_data(self, data: str) -> None:
+        if not self.skipping:
+            (self.cell if self.cell is not None else self.text).append(data)
+
+
+def html_to_text(html: str) -> str:
+    parser = _TextExtractor()
+    parser.feed(html)
+    parser.close()
+    parser._flush()
+    return "\n".join(parser.lines)
+
+
+def _cap(text: str, limit: int) -> tuple[str, str | None]:
+    """At most `limit` characters, cut at a line end, and a note when cut."""
+    if len(text) <= limit:
+        return text, None
+    head = text[:limit]
+    cut = head.rfind("\n")
+    if cut > limit // 2:
+        head = head[:cut]
+    return head, f"first {len(head)} of {len(text)} characters"
+
+
+def latest_earnings_release(submissions: dict[str, Any], today: date) -> dict[str, str] | None:
+    """The newest 8-K reporting results (item 2.02) within EARNINGS_RELEASE_DAYS."""
+    recent = (submissions.get("filings") or {}).get("recent") or {}
+    cutoff = (today - timedelta(days=config.EARNINGS_RELEASE_DAYS)).isoformat()
+    for i, form in enumerate(recent.get("form") or []):
+        filed = recent["filingDate"][i]
+        if filed < cutoff:
+            return None  # newest first: nothing older can qualify
+        items = ((recent.get("items") or [""] * (i + 1))[i] or "").split(",")
+        if form in ("8-K", "8-K/A") and "2.02" in items:
+            return {"accession": recent["accessionNumber"][i], "filed": filed,
+                    "accepted": _accepted_at(recent, i)}
+    return None
+
+
+_EX_99_1 = re.compile(r"ex(?:h|hibit)?[-_]?99[-_.]?0?1(?!\d)")
+
+
+def release_exhibit(index: dict[str, Any]) -> str | None:
+    """The press release in an earnings 8-K: exhibit 99.1. Not 99.2, which is
+    usually the much longer financial supplement (JPM's is ~3.4 MB)."""
+    for item in (index.get("directory") or {}).get("item") or []:
+        name = item.get("name") or ""
+        if name.lower().endswith((".htm", ".html")) and _EX_99_1.search(name.lower()):
+            return name
+    return None
+
+
+def earnings_release_block(
+    edgar: EdgarClient, cik: int, submissions: dict[str, Any], today: date,
+    last_cycle_at: datetime | None,
+) -> dict[str, Any] | None:
+    """The opening of the latest earnings release, or None if there is none
+    within the window. Raises LookupFailed when one exists but cannot be read."""
+    release = latest_earnings_release(submissions, today)
+    if release is None:
+        return None
+    exhibit = release_exhibit(edgar.filing_index(cik, release["accession"]))
+    if exhibit is None:
+        raise LookupFailed(f"8-K filed {release['filed']} has no exhibit 99.1")
+    text, note = _cap(edgar.document_text(cik, release["accession"], exhibit),
+                      config.EARNINGS_RELEASE_MAX_CHARS)
+    source = f"8-K filed {release['filed']}, item 2.02, exhibit {exhibit}"
+    accepted = datetime.fromisoformat(release["accepted"].replace("Z", "+00:00"))
+    if last_cycle_at is None or accepted > last_cycle_at:
+        source += " [new since your last cycle]"
+    block: dict[str, Any] = {"source": source, "text": text}
+    if note:
+        block["truncated"] = note
+    return block
+
+
 def _put(out: dict[str, Any], missing: list[str], key: str, value: Any) -> None:
     if value is None:
         missing.append(key)
@@ -536,9 +723,11 @@ def symbol_block(
     today: date,
     last_cycle_at: datetime | None,
     unavailable: dict[str, str],
+    with_release: bool = False,
 ) -> dict[str, Any]:
     """One name's block. `unavailable` names sources that cannot be called at
-    all this cycle (e.g. no API key), with the reason to show."""
+    all this cycle (e.g. no API key), with the reason to show. `with_release`
+    adds the latest earnings release (holdings only: ~2k tokens each)."""
     if symbol in FUND_SYMBOLS:
         return {"not_applicable": "fund: no company financials or earnings"}
     block: dict[str, Any] = {}
@@ -597,6 +786,17 @@ def symbol_block(
             failed["edgar"] = str(e)
         except PARSE_ERRORS:
             failed["edgar"] = "unexpected response shape"
+        else:
+            # Its own failure, so an unreadable exhibit costs only the release.
+            if with_release:
+                try:
+                    release = earnings_release_block(edgar, cik, submissions, today, last_cycle_at)
+                    if release:
+                        block["earnings_release"] = release
+                except LookupFailed as e:
+                    failed["earnings_release"] = str(e)
+                except PARSE_ERRORS:
+                    failed["earnings_release"] = "unexpected response shape"
 
     if missing:
         block["not_available"] = missing
@@ -611,9 +811,11 @@ def fetch_fundamentals(
     now: datetime,
     finnhub: FinnhubClient | None = None,
     edgar: EdgarClient | None = None,
+    release_for: frozenset[str] | set[str] = frozenset(),
 ) -> dict[str, dict[str, Any]]:
     """Blocks for every symbol, keyed by symbol. Clients are built from the
-    environment unless passed in (tests pass fakes)."""
+    environment unless passed in (tests pass fakes). Names in `release_for`
+    also get their latest earnings release."""
     today = date.fromisoformat(markettime.fmt_et_date(now))
     unavailable: dict[str, str] = {}
     if finnhub is None:
@@ -634,7 +836,8 @@ def fetch_fundamentals(
     for source, reason in unavailable.items():
         print(f"warning: fundamentals: {source} unavailable ({reason})")
     blocks = {
-        s: symbol_block(s, finnhub, edgar, today, last_cycle_at, unavailable)
+        s: symbol_block(s, finnhub, edgar, today, last_cycle_at, unavailable,
+                        with_release=s in release_for)
         for s in symbols
     }
     if edgar is not None:

@@ -208,6 +208,15 @@ put in the prompt deliberately. Three things are, plus one fact feed:
   2026-07-29 10-Q was absent on 2026-10-05); this is named as
   `newer_filing_not_yet_in_sec_data`, and Finnhub's EPS actuals arrive faster.
   BRK.B's estimates are filed under BRK.A (per Class A share) and are withheld.
+  **Holdings also get `earnings_release`** (added 2026-10-14): the opening
+  8,000 characters (~2k tokens) of the latest 8-K item 2.02 exhibit 99.1, for
+  21 days after filing, converted to text with table rows on one line. Added
+  because on 2026-10-13 the agent could not test JNJ's "MedTech stalling"
+  invalidation or JPM's credit leg, though both releases state them on page
+  one (MedTech +2.5%; $2.2B net charge-offs, $539M reserve build). Filing
+  indexes and converted documents are cached under `cache/edgar/docs/` (they
+  never change) and pruned with the rest. `test_earnings_release.py` runs on
+  JNJ's real recorded exhibit.
 
 The record exists because position weight is a lossy encoding of history, and
 re-deriving intent from it produces two specific failures, both observed:

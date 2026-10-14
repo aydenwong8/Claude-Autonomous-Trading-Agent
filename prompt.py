@@ -231,6 +231,12 @@ each cycle from two sources:
 - "material_filings_90d" (EDGAR): 8-Ks with their item descriptions, 10-Qs, 10-Ks \
   and spin-off or merger registrations from the last 90 days, one line each. \
   "[new since your last cycle]" marks filings you have not been shown before.
+- "earnings_release" (EDGAR, holdings only): the company's own press release for \
+  its latest results (the 8-K item 2.02 exhibit), as plain text with table rows \
+  joined by " | ", shown for 21 days after it is filed. This is where segment \
+  results, credit costs, one-off items and guidance are stated, which the EPS \
+  figures above do not show. It is the company describing its own quarter, so \
+  read its emphasis with that in mind; "truncated" means only the opening is shown.
 
 "not_available" names figures the source does not provide for that company (banks, \
 for example, report no operating margin). "not_applicable" marks funds, which have \

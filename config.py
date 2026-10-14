@@ -311,3 +311,9 @@ FILINGS_LOOKBACK_DAYS = 90
 FUNDAMENTALS_HISTORY_QUARTERS = 20
 FUNDAMENTALS_MIN_HISTORY_POINTS = 8
 EARNINGS_LOOKAHEAD_DAYS = 120
+# Holdings get the opening of their latest earnings release (8-K item 2.02,
+# exhibit 99.1) for this many days after it is filed. The first 8,000
+# characters (~2k tokens) carried the headline figures, segment table and
+# guidance in both JNJ's and JPM's 2026-10-13 releases (16.6k and 24k in full).
+EARNINGS_RELEASE_DAYS = 21
+EARNINGS_RELEASE_MAX_CHARS = 8_000

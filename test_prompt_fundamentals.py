@@ -50,6 +50,7 @@ def test_no_fundamentals_means_no_field():
 def test_system_prompt_explains_the_block():
     assert 'WHAT "fundamentals" IS' in agent.SYSTEM_PROMPT
     assert "lookup_failed" in agent.SYSTEM_PROMPT
+    assert '"earnings_release"' in agent.SYSTEM_PROMPT
 
 
 def test_fundamentals_for_asks_for_holdings_and_candidates(monkeypatch):
@@ -57,18 +58,19 @@ def test_fundamentals_for_asks_for_holdings_and_candidates(monkeypatch):
     agent.log_decision_cycle(conn, "p", "r", [], [], portfolio(), NOW, "paper", (1, 2), None)
     seen = {}
 
-    def fake(symbols, last_cycle_at, now):
-        seen.update(symbols=symbols, last=last_cycle_at)
+    def fake(symbols, last_cycle_at, now, release_for=frozenset()):
+        seen.update(symbols=symbols, last=last_cycle_at, release_for=set(release_for))
         return {s: {} for s in symbols}
 
     # Patched where fundamentals_for looks it up, never via another module.
     monkeypatch.setitem(agent.fundamentals_for.__globals__, "fetch_fundamentals", fake)
     agent.fundamentals_for(conn, portfolio(), market(), NOW)
-    assert seen == {"symbols": ["GD", "IQV", "XOM"], "last": NOW}
+    # Only holdings get the earnings release: it is ~2k tokens a name.
+    assert seen == {"symbols": ["GD", "IQV", "XOM"], "last": NOW, "release_for": {"GD"}}
 
 
 def test_a_bug_in_fetching_never_fails_the_cycle(monkeypatch, capsys):
-    def broken(symbols, last_cycle_at, now):
+    def broken(symbols, last_cycle_at, now, release_for=frozenset()):
         raise RuntimeError("bug")
 
     monkeypatch.setitem(agent.fundamentals_for.__globals__, "fetch_fundamentals", broken)
