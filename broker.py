@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -51,13 +52,30 @@ def _news_client():
 # Stage 1: Gather state
 # ---------------------------------------------------------------------------
 
+def _finite(value: Any, what: str) -> float:
+    """A broker figure as a float, or ValueError if it is missing or not finite.
+
+    Every guardrail is a `<`/`>` comparison, and every comparison against NaN
+    is False, so a NaN cash or equity figure would pass the cash buffer and the
+    15% cap rather than fail them. Refuse it here and the cycle stops before
+    Claude is asked, instead of validating trades against a broken snapshot.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"broker returned a non-numeric {what}: {value!r}") from None
+    if not math.isfinite(number):
+        raise ValueError(f"broker returned a non-finite {what}: {value!r}")
+    return number
+
+
 def fetch_pending_orders(client) -> dict[str, list[PendingOrder]]:
     """Open (unfilled) orders at the broker, grouped by symbol.
 
-    A failure here must not take the cycle down: the account state is still
-    usable without it, and an empty result is the same shape as "nothing
-    pending". It does mean the prompt loses its in-flight warning, so the
-    exception is surfaced rather than swallowed silently.
+    A failure here stops the cycle. An empty result would read as "nothing
+    pending", and validation would then let cash already promised to unfilled
+    buys be spent a second time — the overdraw `price_pending_orders` exists
+    to prevent. Skipping a day is recoverable; breaching the buffer is not.
     """
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
@@ -66,16 +84,18 @@ def fetch_pending_orders(client) -> dict[str, list[PendingOrder]]:
     try:
         orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
     except Exception as exc:
-        print(f"  warning: could not read open orders ({type(exc).__name__}: {exc})")
-        return pending
+        raise RuntimeError(
+            f"could not read open orders ({type(exc).__name__}: {exc})"
+        ) from exc
 
     for o in orders:
         pending.setdefault(o.symbol, []).append(
             PendingOrder(
                 symbol=o.symbol,
                 side=str(o.side).split(".")[-1].lower(),
-                notional_usd=float(o.notional) if o.notional is not None else None,
-                qty=float(o.qty) if o.qty is not None else None,
+                notional_usd=(_finite(o.notional, f"{o.symbol} pending order notional")
+                              if o.notional is not None else None),
+                qty=_finite(o.qty, f"{o.symbol} pending order qty") if o.qty is not None else None,
                 status=str(o.status).split(".")[-1].lower(),
                 submitted_at=o.submitted_at.isoformat() if o.submitted_at else None,
             )
@@ -145,16 +165,16 @@ def fetch_portfolio_state(mode: str) -> PortfolioState:
     positions = {
         p.symbol: Position(
             symbol=p.symbol,
-            qty=float(p.qty),
-            market_value=float(p.market_value),
-            avg_entry_price=float(p.avg_entry_price),
+            qty=_finite(p.qty, f"{p.symbol} qty"),
+            market_value=_finite(p.market_value, f"{p.symbol} market_value"),
+            avg_entry_price=_finite(p.avg_entry_price, f"{p.symbol} avg_entry_price"),
         )
         for p in raw_positions
     }
 
     return PortfolioState(
-        cash=float(account.cash),
-        equity=float(account.equity),
+        cash=_finite(account.cash, "account cash"),
+        equity=_finite(account.equity, "account equity"),
         positions=positions,
         timestamp=markettime.now_utc(),
         pending_orders=fetch_pending_orders(client),

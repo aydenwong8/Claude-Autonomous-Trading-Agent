@@ -64,6 +64,7 @@ whenever the prompt is meant to change**, e.g. new data in the prompt.
 `test_fundamentals.py` runs on recorded API responses in `tests/data/fundamentals/`
 (re-record with `record.py` there); `test_prompt_fundamentals.py` covers the wiring.
 `test_screen.py` covers the chunked, retried bar fetch behind the screen.
+`test_broker_state.py` covers the fail-closed account snapshot.
 `test_reexports.py` guards the `agent.X` names; `test_memory.py`,
 `test_version.py` and `test_metrics.py` cover memory, versioning and metrics.
 
@@ -357,8 +358,19 @@ open, and a cycle running before that fill would otherwise see a portfolio
 identical to the one that produced the orders — and propose them again. In
 normal daily operation the list is empty, because the previous cycle's orders
 fill before the next one runs; a non-empty list means something ran twice or a
-fill did not happen. A failure reading orders warns and returns empty rather
-than killing the cycle, since account state is still usable without it.
+fill did not happen. A failure reading orders **stops the cycle** (changed
+2026-10-14; it used to warn and return empty): an empty list reads as "nothing
+pending", and validation would then spend cash already promised to unfilled
+buys a second time.
+
+The account snapshot fails closed the same way. Cash, equity, each position's
+figures and each pending order's size go through `broker.py:_finite`, which
+raises on a missing, non-numeric, NaN or infinite value. Every guardrail is a
+`<`/`>` comparison and every comparison against NaN is False, so a NaN cash or
+equity figure would otherwise pass the cash buffer and the 15% cap instead of
+failing them. A missing pending-order notional is not bad data — share-sized
+orders have none — and is valued later by `price_pending_orders`.
+`test_broker_state.py` covers both.
 
 ## Database (`trading_agent.db`, gitignored)
 
