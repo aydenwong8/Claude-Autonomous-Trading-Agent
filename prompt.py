@@ -264,7 +264,6 @@ Guardrails your proposals will be checked against:
 - Universe: long-only, whitelisted US equities/ETFs only
 - No leverage, margin, or options — buys are funded from available cash only
 - Minimum cash buffer: 5% of equity must remain uninvested
-- At most 5 trades per decision cycle
 
 HOW CAPITAL ACTUALLY MOVES
 

@@ -23,7 +23,6 @@ def validate_trades(
         - Universe: long-only, whitelisted US equities/ETFs
         - No leverage, margin, or options
         - Minimum cash buffer: 5%
-        - Max trades per decision cycle: 5
         - Every symbol verified against the broker asset list before ordering
 
     Invalid trades are rejected, never silently adjusted.
@@ -65,11 +64,7 @@ def validate_trades(
 
     trading_client = None  # lazily created only if a ticker actually needs checking
 
-    for i, trade in enumerate(trades):
-        if i >= config.MAX_TRADES_PER_CYCLE:
-            results.append(ValidatedTrade(trade, False, "exceeds max trades per decision cycle"))
-            continue
-
+    for trade in trades:
         if trade.side not in ("buy", "sell"):
             results.append(ValidatedTrade(trade, False, f"unrecognized side '{trade.side}'"))
             continue

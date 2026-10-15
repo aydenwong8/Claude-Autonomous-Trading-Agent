@@ -276,7 +276,6 @@ fails any of these must be **rejected and logged, never silently adjusted**.
 | Universe | Long-only, whitelisted US equities/ETFs (`config.WATCHLIST`) |
 | Leverage / margin / options | Not permitted (buys funded from available cash only) |
 | Minimum cash buffer | 5% of equity |
-| Max trades per decision cycle | 5 |
 | Ticker validation | Every symbol verified tradable against the broker asset list before ordering |
 | Order idempotency | Deterministic `client_order_id` per session/symbol/side/amount; the broker rejects a repeat |
 

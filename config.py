@@ -13,7 +13,6 @@ held (sells are exempt from the whitelist check for exactly that reason).
 # --- Guardrails (README.md#guardrails) ---------------------------------------
 MAX_POSITION_PCT = 0.15        # max 15% of portfolio per ticker
 MIN_CASH_BUFFER_PCT = 0.05     # keep at least 5% of equity in cash
-MAX_TRADES_PER_CYCLE = 5       # reject proposed trades beyond this count
 # Alpaca rejects notional orders under $1. Catching it here keeps a trivially
 # small trade from becoming a broker exception mid-execution.
 MIN_TRADE_NOTIONAL_USD = 1.0

@@ -150,11 +150,8 @@ def test_sell_proceeds_are_not_spendable_in_the_same_cycle(broker):
 # --- trade count -------------------------------------------------------------
 
 
-def test_at_most_five_trades_per_cycle(broker):
-    assert config.MAX_TRADES_PER_CYCLE == 5
-    results = check([sell("AAPL", 10)] * 6, portfolio())
-    assert results[:5] == [OK] * 5
-    assert results[5] == (False, "exceeds max trades per decision cycle")
+def test_no_cap_on_trades_per_cycle(broker):
+    assert check([sell("AAPL", 10)] * 6, portfolio()) == [OK] * 6
 
 
 # --- universe and ticker validation ------------------------------------------
