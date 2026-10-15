@@ -65,6 +65,10 @@ whenever the prompt is meant to change**, e.g. new data in the prompt.
 (re-record with `record.py` there); `test_prompt_fundamentals.py` covers the wiring.
 `test_screen.py` covers the chunked, retried bar fetch behind the screen.
 `test_broker_state.py` covers the fail-closed account snapshot.
+`test_order_idempotency.py` covers `client_order_id` and the
+`duplicate_suppressed` / `submit_failed` split in `execute_trades`.
+CI (`.github/workflows/tests.yml`) runs the suite on every push to `main`;
+it needs no secrets, and the golden test skips there.
 `test_reexports.py` guards the `agent.X` names; `test_memory.py`,
 `test_version.py` and `test_metrics.py` cover memory, versioning and metrics.
 

@@ -1,4 +1,6 @@
 # Claude Autonomous Trading Agent
+
+[![tests](https://github.com/aydenwong8/Claude-Autonomous-Trading-Agent/actions/workflows/tests.yml/badge.svg)](https://github.com/aydenwong8/Claude-Autonomous-Trading-Agent/actions/workflows/tests.yml)
  
 ## Overview
  
@@ -60,6 +62,13 @@ Non-finite (`NaN`/`Infinity`) trade sizes are rejected at parse time — every g
 is a numeric comparison, and comparisons against `NaN` are always false, so such a
 value would otherwise satisfy all of them.
 
+**Every guardrail is unit-tested.** Each rejection path in `validate_trades` has a test
+in `test_guardrails.py` — both sides of every limit, the unfilled-order cases, and the
+thesis / exit-trigger requirements — as do the live-trading lock and order idempotency
+(`test_order_idempotency.py`: a rerun of the same session is suppressed, not doubled).
+The suite runs on fakes and recorded API responses, needs no keys, and runs in CI on
+every push.
+
 **Trade frequency.** The agent runs once daily after the close, not weekly as originally
 designed. Nothing in code enforces a trade-frequency limit, and the prompt no longer
 advises one either: "most days should be zero trades" was removed on 2026-10-08, so
@@ -68,13 +77,13 @@ cannot actually bind: pattern-day-trading counts same-session round trips, and a
 that decides once after the close and holds overnight has no way to make one. The real
 observed risk runs the other way — see below.
 
-**What the guardrails have actually caught: nothing.** Over the first 28 cycles, all 21
-proposed trades passed validation and none were rejected. The set is worth keeping —
-it is what makes autonomy safe to run unattended, and an untriggered guardrail is doing
-its job — but the binding constraint on this agent is inertia, not permissiveness: 20 of
-28 cycles proposed no trades at all, review verdicts ran 244 `hold` / 6 `trim` / 0
-`exit`, and not one thesis has been closed, so the exit path has never executed in
-production. Any new rule proposed here should first be checked against
+**What the guardrails have actually caught: nothing.** Over the first 60 cycles (to
+2026-10-14), all 36 proposed trades passed validation and none were rejected. The set is
+worth keeping — it is what makes autonomy safe to run unattended, and an untriggered
+guardrail is doing its job — but the binding constraint on this agent is inertia, not
+permissiveness: 35 of 60 cycles proposed no trades at all, review verdicts ran 603
+`hold` / 13 `trim` / 0 `exit`, and not one thesis has been closed, so the exit path has
+never executed in production. Any new rule proposed here should first be checked against
 `trades.rejection_reason` for evidence the existing ones bind.
 
 ## Thesis Lifecycle
@@ -98,6 +107,9 @@ auditable rather than merely active.
   only way to change the wording. The prompt shows the revision count back to the agent
   precisely so that ratcheting a target behind a rising price stays visible as the
   goalpost-moving it would be.
+- **Adopting.** A held position with no stored case — opened before thesis tracking
+  existed, or outside the agent — can be adopted by a review that supplies all three
+  fields, rather than having to be sold and rebought to get one.
 - **Reviewing.** Every cycle returns a verdict for *every* open position — `hold`,
   `trim`, or `exit` — even on days with no trades. A `trim`/`exit` verdict with no
   matching sell is recorded as the agent contradicting itself, and surfaces on the
@@ -116,7 +128,7 @@ auditable rather than merely active.
 
 ## Rollout Phases
  
-- **Phase 1 — Paper (4–8 weeks):** identical code, Alpaca paper-trading keys. Goal: shake out bugs, verify logging, watch behavior.
+- **Phase 1 — Paper (running since 2026-07-16; originally planned as 4–8 weeks):** identical code, Alpaca paper-trading keys. Goal: shake out bugs, verify logging, watch behavior.
 - **Phase 2 — Live (small):** swap to live API keys with a small, loss-tolerable amount of capital. **Deferred, no date set** — the focus for now is improving risk-adjusted returns on paper.
 - **Phase 3 — Project layer:** performance dashboard vs. SPY, automated trade-reasoning writeups, optional auto-posting. (The dashboard is built — `dashboard.py`.)
 
@@ -163,6 +175,20 @@ coverage** (50 articles reaching 37 of 520 names), and most holdings were review
 no news at all — while the model had no way to tell "no news" from "not looked up".
 Per-position lookups take coverage of holdings to 100% for about 0.6s per cycle.
 
+Beyond holdings and the market sample, three more feeds are injected:
+
+- **Candidate news** — each name on the day's screened shortlist gets its own lookup,
+  showing the newest 3 dated headlines. Without it, the only current information behind
+  a case for a name not yet held was the price table.
+- **Drawdown news** — candidates trading at least 25% below their 52-week high get up to
+  5 dated headlines from around their steepest 5-day fall. Those falls are often months
+  old, so the last 30 days of news cannot explain them; the agent was passing on names
+  saying it "was not given the cause".
+- **Filings text (holdings only)** — the opening of the latest earnings release (8-K item
+  2.02, exhibit 99.1) for 21 days after filing, plus the item text of up to three other
+  8-Ks from the last 30 days. A one-line filing list cannot test an invalidation like
+  "segment growth stalling"; the release usually states it on page one.
+
 ## Tech Stack
  
 - Python — standard library only for analysis; no Pandas/NumPy dependency
@@ -173,7 +199,7 @@ Per-position lookups take coverage of holdings to 100% for about 0.6s per cycle.
 - launchd (`run_daily.sh`) — weekdays at 16:30 ET, skipping market holidays
 ## API Costs
  
-- **Anthropic API:** pay-as-you-go per token, separate from any Claude.ai subscription. Measured, not estimated: on Claude Opus 5.5 at medium effort ($4/$20 per million tokens), cycles 48–50 averaged **~45,000 input and ~5,500 output tokens ≈ $0.29/run**, or **~$6/month** at 21 trading days. The prompt grew from ~27k tokens as the self-history, news archive, and candidate screen were added; output fell sharply on the move from Opus 5 at xhigh effort (~17k output tokens, ~$0.67/run).
+- **Anthropic API:** pay-as-you-go per token, separate from any Claude.ai subscription. Measured, not estimated: on Claude Opus 5.5 at medium effort ($4/$20 per million tokens), cycles 56–60 averaged **~79,000 input and ~7,000 output tokens ≈ $0.46/run**, or **~$10/month** at 21 trading days. The prompt grew from ~27k tokens as the self-history, news archive, and candidate screen were added, then to ~45k (≈$0.29/run at cycles 48–50), and roughly doubled again once fundamentals and filings text arrived; output fell sharply on the move from Opus 5 at xhigh effort (~17k output tokens, ~$0.67/run).
 - **Alpaca:** free (commission-free trading, free paper environment)
 - **Market data and news:** included with Alpaca at no additional cost
 
@@ -201,14 +227,20 @@ Per-position lookups take coverage of holdings to 100% for about 0.6s per cycle.
 ## How to Run
  
 ```bash
-git clone https://github.com/yourusername/claude-trading-agent.git
-cd claude-trading-agent
-pip install -r requirements.txt
-cp .env.example .env   # add ANTHROPIC_API_KEY + Alpaca keys (paper first!)
-python agent.py --mode paper       # one decision cycle
-python dashboard.py --mode paper   # regenerate dashboard.html
-python report.py                   # per-position thesis / verdict report
+git clone https://github.com/aydenwong8/Claude-Autonomous-Trading-Agent.git
+cd Claude-Autonomous-Trading-Agent
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+cp .env.example .env   # add Anthropic, Alpaca (paper first!), Finnhub keys + SEC_USER_AGENT
+venv/bin/python agent.py --mode paper       # one decision cycle
+venv/bin/python dashboard.py --mode paper   # regenerate dashboard.html
+venv/bin/python report.py                   # per-position thesis / verdict report
+venv/bin/python -m pytest -q                # test suite
 ```
+
+`SEC_USER_AGENT` is required by the SEC (`"<project name> <contact email>"`); without it
+every EDGAR lookup fails. `run_daily.sh` is what the scheduler invokes and expects the
+`venv/` above.
 
 `--mode live` is locked and will refuse to run. Unlocking it is a deliberate, separate
 act, and is not something to put in `.env` where a scheduled run could pick it up:
