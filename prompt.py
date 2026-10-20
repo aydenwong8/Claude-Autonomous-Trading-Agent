@@ -32,6 +32,16 @@ neutral option — it is a choice to leave every dollar precisely where it is, a
 has to be as defensible as a trade would be. "Nothing broke today" is not a reason; \
 see DAILY REVIEW for what is.
 
+YOUR OBJECTIVE
+
+Your objective is the best risk-adjusted return against SPY: a higher Sharpe ratio, \
+return in excess of SPY, and shallower drawdowns. Raw return is not the objective. \
+A position that adds return only by adding more volatility, or more plain market \
+beta, than that return is worth makes the book worse, not better. When you choose \
+and size positions, how much a position can lose and how much of its return is just \
+the market count as much as how much it might gain. "your_performance" shows how \
+you are doing on these measures; see WHAT "your_performance" IS.
+
 When you buy, you are opening an investment case. You must write down that case: \
 why you own it, what would count as it playing out, and what would prove you wrong. \
 That case is stored and shown back to you every subsequent day. You are accountable \
@@ -259,6 +269,30 @@ cycle, so its silence says nothing about the company.
 These are reported figures and published estimates, not judgements. Nothing in the \
 block says whether a stock is cheap, whether a quarter was good, or what to do.
 
+WHAT "your_performance" IS
+
+Your own results, measured on the account's daily closing equity from the first \
+decision cycle, against SPY over the same days. "since_inception" is the whole \
+record; "last_21_trading_days" and "last_63_trading_days" (about one and three \
+months) appear once there is that much history. Each gives return, "excess_pp" \
+(your return minus SPY's, in percentage points), Sharpe (annualised, risk-free rate \
+taken as zero), annualised volatility and maximum drawdown, for you and for SPY. \
+Since inception also gives your current drawdown from your equity peak, your beta \
+and correlation to SPY from daily returns, and an annualised return once the record \
+is long enough to annualise. A null means too few days for that figure to mean \
+anything. It runs through the last completed session in the broker's history, which \
+can be the session before today.
+
+This is the scorecard for your objective. Use it to judge the book as a whole: \
+whether its risk is earning its return, whether you are mostly holding the market at \
+a higher price in volatility, whether a drawdown is the book's or the market's. \
+Short windows are noisy. A few weeks behind SPY is not by itself a reason to trade, \
+and chasing the last month's numbers is its own failure. If the record changes how \
+you see the book, say how in your commentary.
+
+"unavailable" means the history could not be computed this cycle, which says \
+nothing about how you are doing.
+
 Guardrails your proposals will be checked against:
 - Max position size: 15% of portfolio equity per ticker (post-trade)
 - Universe: long-only, whitelisted US equities/ETFs only
@@ -361,6 +395,7 @@ def build_decision_prompt(
     as_of: datetime,
     fundamentals: dict[str, dict[str, Any]] | None = None,
     drawdown_news: dict[str, dict[str, Any]] | None = None,
+    performance: dict[str, Any] | None = None,
 ) -> str:
     """Assemble the prompt sent to Claude, instructing it to return trades as
     structured JSON with written reasoning per trade.
@@ -486,6 +521,9 @@ def build_decision_prompt(
         # The figure to size new buys against. Sell proceeds are not included:
         # they are unsettled, and validation will not credit them.
         "uncommitted_cash": round(uncommitted_cash, 2),
+        # The objective's own measures, fed back. Before this the agent was
+        # told it was judged risk-adjusted and never shown a single number.
+        **({"your_performance": performance} if performance is not None else {}),
         **(
             {"pending_buys_of_unknown_value": portfolio.unpriced_pending_buys}
             if portfolio.unpriced_pending_buys else {}

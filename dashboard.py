@@ -314,11 +314,8 @@ def fetch_behavioral_metrics(db_path: str, agent_points: list[tuple[str, float]]
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         return {
-            "annualized_return_pct": (
-                None
-                if (r := metrics.compute_annualized_return(agent_points)) is None
-                else r * 100
-            ),
+            # Already a percentage; multiplying again showed +2103.6% for ~21%.
+            "annualized_return_pct": metrics.compute_annualized_return(agent_points),
             "annualized_min_days": metrics.MIN_TRADING_DAYS_FOR_ANNUALIZING,
             "turnover": metrics.compute_turnover(conn, agent_points),
             "rejection": metrics.compute_rejection_stats(conn),

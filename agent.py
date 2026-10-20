@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 import config
 import markettime
 from fundamentals import fetch_fundamentals
+from performance import fetch_performance
 from models import (  # re-exported: agent.X must keep working
     Position,
     PendingOrder,
@@ -172,9 +173,10 @@ def run_decision_cycle(mode: str, watchlist: list[str], db_path: str) -> None:
         theses = fetch_open_theses(conn)
         actions = fetch_action_history(conn)
         fundamentals = fundamentals_for(conn, portfolio, market, now)
+        performance = fetch_performance(conn, mode, now)
         prompt = build_decision_prompt(
             portfolio, market, theses, actions, news_history, candidate_news, now,
-            fundamentals, drawdown_news,
+            fundamentals, drawdown_news, performance,
         )
         trades, reviews, raw_response, usage = get_claude_decision(prompt)
         validated = validate_trades(trades, portfolio, mode)

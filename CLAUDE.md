@@ -21,7 +21,12 @@ Zero human override: every trade is proposed by Claude and then accepted or
 rejected by code-enforced guardrails, never by a human in the loop.
 
 **The objective is the best risk-adjusted return against the S&P 500 (SPY)** —
-Sharpe, alpha, and drawdown, not raw return. Judge a change by whether it
+Sharpe, alpha, and drawdown, not raw return. Since 2026-10-20 the agent itself
+is told this (`YOUR OBJECTIVE` in `SYSTEM_PROMPT`) and shown its own figures on
+those measures each cycle (`performance.py`). Commit 86d2f6a wrote the objective
+into these docs only, so for its first 64 cycles the agent saw "benchmarked against
+SPY" and two passing mentions of risk-adjusted judging, and none of its own
+numbers. Judge a change by whether it
 improves that, measured per agent version (`decision_cycles.code_commit`).
 The operator's stance is to let Claude mostly do its own thing: change the
 inputs and the plumbing, not its individual decisions.
@@ -41,6 +46,7 @@ inputs and the plumbing, not its individual decisions.
 | `theses.py` | Open theses, action history (`fetch_action_history`), the thesis lifecycle, orphan cleanup. |
 | `db.py` | Schema, migrations, run/cycle logging, prompt log. |
 | `fundamentals.py` | Finnhub + SEC EDGAR facts per name: valuation against its own 5-year history, earnings dates with consensus, the last 4 quarters' EPS against estimate, the latest reported quarter, material filings. Never raises; failures become per-name `lookup_failed`. Cache in `cache/edgar/` (gitignored, pruned after 30 days). |
+| `performance.py` | The agent's own scorecard for the prompt (`your_performance`): return, excess over SPY, Sharpe, volatility and max drawdown, for both, since inception and over the last 21 / 63 trading days, plus current drawdown, beta and correlation to SPY. Same sources and definitions as the dashboard (broker daily equity from the first cycle, IEX SPY closes, 252-day Sharpe at a zero risk-free rate), joined on date. Never raises; failure becomes `{"unavailable": ...}`. Covered by `test_performance.py`. |
 | `config.py` | Guardrail thresholds, `CLAUDE_MODEL` / `CLAUDE_MAX_TOKENS`, `VALID_EXIT_TRIGGERS`, and `WATCHLIST` (S&P 1500 ∪ Nasdaq-100 plus SPY/QQQ, ~1,500 symbols, snapshotted 2026-08-05 — index membership drifts, refresh occasionally). |
 | `markettime.py` | Store UTC, display Eastern. Every display boundary — console, dashboard, report, *and the prompt Claude reads* — converts through here. Do not format timestamps ad hoc elsewhere. |
 | `dashboard.py` | Reads Alpaca + the DB, writes a self-contained `dashboard.html` (agent equity curve vs. buy-and-hold SPY, holdings, risk stats, decision log). No server, no external requests at view time. |
@@ -166,7 +172,11 @@ This is the core behavioral design. README.md summarises it; the detail is here.
 
 Each cycle is a **stateless single-turn call** — `messages=[{"role": "user", ...}]`,
 no conversation history. Everything the model knows about its own past has to be
-put in the prompt deliberately. Three things are, plus one fact feed:
+put in the prompt deliberately. Four things are, plus one fact feed:
+
+- **The scorecard** (`performance.fetch_performance`) — how it is *doing* on the
+  objective, as `your_performance` in the state block. Added 2026-10-20; the
+  prompt tells it short windows are noisy and not by themselves a reason to trade.
 
 - **The case** (`fetch_open_theses`) — what it *believed*, injected per position.
 - **The record** (`fetch_action_history`) — what it *did*, injected per position
