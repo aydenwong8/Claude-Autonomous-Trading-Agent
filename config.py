@@ -301,6 +301,12 @@ SCREEN_PER_BUCKET = 10
 SCREEN_BAR_CHUNK = 200
 SCREEN_RETRY_WAITS = (5, 20, 60)
 
+# alpaca-py sends every request with no timeout, so one dead socket hangs the
+# cycle forever: 2026-10-19 sat 2h40m on a connection reset after the calendar
+# check. (connect, read) seconds; the read limit is per socket read, not per
+# request, so a large bar chunk that is still streaming is not cut off.
+ALPACA_TIMEOUT = (10, 60)
+
 # --- Storage --------------------------------------------------------------------
 DEFAULT_DB_PATH = "trading_agent.db"
 

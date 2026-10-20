@@ -15,6 +15,25 @@ from models import PendingOrder, PortfolioState, Position, ProposedTrade, Valida
 # Broker client helpers
 # ---------------------------------------------------------------------------
 
+def _with_timeout(client):
+    """Give every request the client makes a timeout.
+
+    alpaca-py calls `session.request` with no `timeout`, and requests waits
+    forever by default, so a connection that dies mid-response hangs the cycle
+    instead of failing it. A timeout raises, and the cycle fails closed like
+    any other broker error. A timed-out order POST may still have landed, but
+    a rerun is safe: client_order_id makes the repeat a no-op.
+    """
+    request = client._session.request
+
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", config.ALPACA_TIMEOUT)
+        return request(method, url, **kwargs)
+
+    client._session.request = request_with_timeout
+    return client
+
+
 def _trading_client(mode: str):
     from alpaca.trading.client import TradingClient
 
@@ -23,29 +42,29 @@ def _trading_client(mode: str):
     # reach a real account without clearing the lock.
     config.assert_mode_allowed(mode)
 
-    return TradingClient(
+    return _with_timeout(TradingClient(
         api_key=os.environ["ALPACA_API_KEY"],
         secret_key=os.environ["ALPACA_SECRET_KEY"],
         paper=(mode == "paper"),
-    )
+    ))
 
 
 def _data_client():
     from alpaca.data.historical.stock import StockHistoricalDataClient
 
-    return StockHistoricalDataClient(
+    return _with_timeout(StockHistoricalDataClient(
         api_key=os.environ["ALPACA_API_KEY"],
         secret_key=os.environ["ALPACA_SECRET_KEY"],
-    )
+    ))
 
 
 def _news_client():
     from alpaca.data.historical.news import NewsClient
 
-    return NewsClient(
+    return _with_timeout(NewsClient(
         api_key=os.environ["ALPACA_API_KEY"],
         secret_key=os.environ["ALPACA_SECRET_KEY"],
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
