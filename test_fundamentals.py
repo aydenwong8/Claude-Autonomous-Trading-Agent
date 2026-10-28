@@ -234,6 +234,57 @@ def test_bank_line_items(tmp_path):
     assert jpm["material_filings_90d"]
 
 
+# GD on 2026-10-28, as Finnhub returned it: Q3 dated 22 Oct (GD reports 30 Oct)
+# with no result, so the next date shown was January's Q4 and its consensus.
+GD_CALENDAR_LATE = {"earningsCalendar": [
+    {"symbol": "GD", "date": "2027-01-26", "hour": "amc", "quarter": 4, "year": 2026,
+     "epsEstimate": 4.6794, "epsActual": None, "revenueEstimate": 15156457158},
+    {"symbol": "GD", "date": "2026-10-22", "hour": "bmo", "quarter": 3, "year": 2026,
+     "epsEstimate": 4.2502, "epsActual": None, "revenueEstimate": 14142873020},
+]}
+GD_HISTORY_TO_Q2 = [
+    {"symbol": "GD", "estimate": 4.0905, "actual": 4.24, "period": "2026-06-30",
+     "surprisePercent": 3.6548, "year": 2026, "quarter": 2},
+]
+
+
+def test_a_passed_date_with_no_result_is_shown_as_not_yet_reported():
+    out = f.earnings_block("GD", GD_CALENDAR_LATE, GD_HISTORY_TO_Q2, date(2026, 10, 28), [])
+    assert out["next_report"] == (
+        "2026Q3 not reported yet: the calendar dated it 2026-10-22 before open, "
+        "which has passed, and gives no new date"
+    )
+    assert "days_until" not in out
+    assert out["consensus_eps"] == 4.25  # Q3's, not January's Q4
+    assert out["consensus_revenue_usd_bn"] == 14.14
+    assert out["report_after_that"] == "2027-01-26 after close"
+
+
+def test_a_passed_date_that_was_reported_is_not_flagged():
+    iqv_calendar = {"earningsCalendar": [
+        {"symbol": "IQV", "date": "2027-02-03", "hour": "amc", "quarter": 4, "year": 2026,
+         "epsEstimate": 3.6817, "epsActual": None},
+        {"symbol": "IQV", "date": "2026-10-27", "hour": "bmo", "quarter": 3, "year": 2026,
+         "epsEstimate": 3.3079, "epsActual": 3.34},
+    ]}
+    out = f.earnings_block("IQV", iqv_calendar, [], date(2026, 10, 28), [])
+    assert out["next_report"] == "2027-02-03 after close"
+    assert out["days_until"] == 98
+    assert "report_after_that" not in out
+    # Finnhub's history can list the quarter before the calendar's actual is filled.
+    gd_reported = [dict(GD_HISTORY_TO_Q2[0], quarter=3, period="2026-09-30")]
+    out = f.earnings_block("GD", GD_CALENDAR_LATE, gd_reported, date(2026, 10, 28), [])
+    assert out["next_report"] == "2027-01-26 after close"
+
+
+def test_the_calendar_is_asked_for_recent_past_dates_too():
+    get = FakeGet()
+    limiter = f.RateLimiter(1000, 1.0, clock=lambda: 0.0, sleep=lambda s: None)
+    f.FinnhubClient("KEY", limiter, get=get).calendar("GD", date(2026, 10, 28))
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(get.urls[0]).query))
+    assert query["from"] == "2026-09-28"
+
+
 def test_share_class_estimates_are_withheld(tmp_path):
     brk, get = blocks(tmp_path, symbols=("BRK.B",))
     brk = brk["BRK.B"]

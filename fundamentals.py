@@ -19,6 +19,7 @@ report" when it means "not looked up".
 
 from __future__ import annotations
 
+import html
 import http.client
 import json
 import os
@@ -189,9 +190,10 @@ class FinnhubClient:
     def calendar(self, symbol: str, today: date) -> dict[str, Any]:
         # Per symbol: a date-range query without one is capped at 1,500 rows
         # and silently drops names.
+        start = today - timedelta(days=config.EARNINGS_OVERDUE_LOOKBACK_DAYS)
         end = today + timedelta(days=config.EARNINGS_LOOKAHEAD_DAYS)
         return self._call("/calendar/earnings", symbol=symbol,
-                          **{"from": today.isoformat(), "to": end.isoformat()})
+                          **{"from": start.isoformat(), "to": end.isoformat()})
 
     def earnings_history(self, symbol: str) -> list[dict[str, Any]]:
         return self._call("/stock/earnings", symbol=symbol, limit=4)
@@ -272,6 +274,28 @@ class EdgarClient:
             cik=cik, accession=accession.replace("-", ""), name="index.json"))
         _write_json(path, index)
         return index
+
+    def filing_headers(self, cik: int, accession: str) -> str:
+        """The filing's SGML headers, which declare each document's type
+        (EX-99.1 ...). Cached like document_text; a filing never changes."""
+        path = self.cache_dir / "docs" / f"{accession}-index-headers.html"
+        try:
+            text = path.read_text()
+            path.touch()
+            return text
+        except OSError:
+            pass
+        text = self.get_text(
+            SEC_FILING_URL.format(cik=cik, accession=accession.replace("-", ""),
+                                  name=f"{accession}-index-headers.html"),
+            self.headers, self.limiter,
+        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        except OSError:
+            pass
+        return text
 
     def document_text(self, cik: int, accession: str, name: str) -> str:
         """A filed document as plain text. Filings never change once accepted,
@@ -393,16 +417,35 @@ def earnings_block(
 ) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if calendar_json is not None:
-        upcoming = sorted(
-            (e for e in calendar_json.get("earningsCalendar") or []
-             if e.get("date") and e["date"] >= today.isoformat()),
+        dated = sorted(
+            (e for e in calendar_json.get("earningsCalendar") or [] if e.get("date")),
             key=lambda e: e["date"],
         )
-        if upcoming:
-            e = upcoming[0]
+        upcoming = [e for e in dated if e["date"] >= today.isoformat()]
+        # A passed date is unreported if neither the calendar nor the history
+        # has a result for it: the company has not reported, or moved the date.
+        reported = {(h.get("year"), h.get("quarter")) for h in history_json or []
+                    if h.get("actual") is not None}
+        overdue = [e for e in dated if e["date"] < today.isoformat()
+                   and e.get("epsActual") is None
+                   and (e.get("year"), e.get("quarter")) not in reported]
+        e = overdue[-1] if overdue else upcoming[0] if upcoming else None
+        if e is not None:
             hour = EARNINGS_HOURS.get(e.get("hour") or "", "time not given")
-            out["next_report"] = f"{e['date']} {hour}"
-            out["days_until"] = (date.fromisoformat(e["date"]) - today).days
+            if overdue:
+                out["next_report"] = (
+                    f"{e.get('year')}Q{e.get('quarter')} not reported yet: the calendar "
+                    f"dated it {e['date']} {hour}, which has passed, and gives no new date"
+                )
+                if upcoming:
+                    after = upcoming[0]
+                    out["report_after_that"] = (
+                        f"{after['date']} "
+                        f"{EARNINGS_HOURS.get(after.get('hour') or '', 'time not given')}"
+                    )
+            else:
+                out["next_report"] = f"{e['date']} {hour}"
+                out["days_until"] = (date.fromisoformat(e["date"]) - today).days
             if e.get("symbol") not in (None, symbol):
                 # BRK.B's entry is filed under BRK.A, whose per-share figures are
                 # ~1,500x a Class B share's. The date holds; the estimate doesn't.
@@ -690,6 +733,19 @@ def release_exhibit(index: dict[str, Any]) -> str | None:
     return None
 
 
+_DECLARED = re.compile(r"<TYPE>([^\s<]+)\s+(?:<SEQUENCE>\S*\s+)?<FILENAME>([^\s<]+)")
+
+
+def declared_exhibit(headers: str, doc_type: str) -> str | None:
+    """The file the filer declared as doc_type, from a filing's index headers.
+    Needed when the name says nothing: IQV's 2026-10-27 release is
+    iqv-q3x2026earningspressre.htm, V's q42026earningsrelease.htm."""
+    for declared, name in _DECLARED.findall(html.unescape(headers)):
+        if declared.upper() == doc_type and name.lower().endswith((".htm", ".html")):
+            return name
+    return None
+
+
 def earnings_release_block(
     edgar: EdgarClient, cik: int, submissions: dict[str, Any], today: date,
     last_cycle_at: datetime | None,
@@ -699,7 +755,9 @@ def earnings_release_block(
     release = latest_earnings_release(submissions, today)
     if release is None:
         return None
-    exhibit = release_exhibit(edgar.filing_index(cik, release["accession"]))
+    exhibit = (release_exhibit(edgar.filing_index(cik, release["accession"]))
+               or declared_exhibit(edgar.filing_headers(cik, release["accession"]),
+                                   "EX-99.1"))
     if exhibit is None:
         raise LookupFailed(f"8-K filed {release['filed']} has no exhibit 99.1")
     text, note = _cap(edgar.document_text(cik, release["accession"], exhibit),

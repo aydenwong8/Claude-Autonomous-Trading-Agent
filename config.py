@@ -323,6 +323,11 @@ FILINGS_LOOKBACK_DAYS = 90
 FUNDAMENTALS_HISTORY_QUARTERS = 20
 FUNDAMENTALS_MIN_HISTORY_POINTS = 8
 EARNINGS_LOOKAHEAD_DAYS = 120
+# The calendar is also read this far back, so a date that passed with no
+# result is shown as unreported rather than skipped: on 2026-10-28 Finnhub
+# still dated GD's Q3 to 22 Oct (it reports 30 Oct), and the agent was shown
+# January's Q4 as next.
+EARNINGS_OVERDUE_LOOKBACK_DAYS = 30
 # Holdings get the opening of their latest earnings release (8-K item 2.02,
 # exhibit 99.1) for this many days after it is filed. The first 8,000
 # characters (~2k tokens) carried the headline figures, segment table and

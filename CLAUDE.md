@@ -239,8 +239,16 @@ put in the prompt deliberately. Four things are, plus one fact feed:
   invalidation or JPM's credit leg, though both releases state them on page
   one (MedTech +2.5%; $2.2B net charge-offs, $539M reserve build). Filing
   indexes and converted documents are cached under `cache/edgar/docs/` (they
-  never change) and pruned with the rest. `test_earnings_release.py` runs on
-  JNJ's real recorded exhibit. Holdings also get `recent_8k_text`: the item
+  never change) and pruned with the rest. The exhibit is found by filename
+  first, then by the type declared in the filing's `-index-headers.html`:
+  IQV's and V's 2026-10-27 releases were named without "99.1" and failed as
+  "no exhibit 99.1" until then. `test_earnings_release.py` runs on JNJ's and
+  IQV's real recorded filings. The earnings calendar is also read
+  `EARNINGS_OVERDUE_LOOKBACK_DAYS` (30) back: a passed date with no result in
+  either the calendar or the EPS history is shown as `next_report: "…not
+  reported yet…"` with that quarter's consensus, and the following date as
+  `report_after_that`. Finnhub dated GD's Q3 to 22 Oct (it reports 30 Oct), so
+  on 2026-10-28 the agent was shown January's Q4, and Q4's consensus, as next. Holdings also get `recent_8k_text`: the item
   text of up to 3 non-results 8-Ks from the last 30 days (cover page, 9.01
   exhibit list and signature cut; ≤3,000 characters each), because the
   one-line filing list left IQV's 23 Sep debt 8-K an open question for three

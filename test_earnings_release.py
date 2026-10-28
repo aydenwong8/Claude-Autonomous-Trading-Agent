@@ -11,6 +11,8 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pytest
+
 import config
 import fundamentals as f
 
@@ -140,6 +142,71 @@ def test_no_release_in_the_window_fetches_nothing(tmp_path):
     assert f.earnings_release_block(edgar(tmp_path, sec), JNJ_CIK, subs,
                                     TODAY, LAST_CYCLE) is None
     assert sec.urls == []
+
+
+# --- an exhibit whose filename does not say 99.1 ---------------------------------
+
+IQV_CIK = 1478242
+IQV_RELEASE = "0001628280-26-067406"
+IQV_SUBMISSIONS = submissions(("8-K", "2026-10-27", "2.02,9.01", IQV_RELEASE))
+IQV_TODAY = date(2026, 10, 28)
+
+
+class IqvSec:
+    """IQV's real 27 Oct filing index and headers: its press release is
+    iqv-q3x2026earningspressre.htm, declared EX-99.1 only in the headers."""
+
+    def __init__(self, headers=None):
+        self.urls = []
+        self.headers = headers
+
+    def json(self, url, headers, limiter):
+        self.urls.append(url)
+        assert url.endswith("index.json"), url
+        return json.loads((FIXTURES / f"edgar_index_IQV_{IQV_RELEASE}.json").read_text())
+
+    def text(self, url, headers, limiter):
+        self.urls.append(url)
+        if url.endswith(f"{IQV_RELEASE}-index-headers.html"):
+            if self.headers is not None:
+                return self.headers
+            return (FIXTURES / f"edgar_index_headers_IQV_{IQV_RELEASE}.html").read_text()
+        assert url.endswith("iqv-q3x2026earningspressre.htm"), url
+        return "<p>IQVIA Reports Third-Quarter 2026 Results</p>"
+
+
+def iqv_edgar(tmp_path, sec):
+    limiter = f.RateLimiter(1000, 1.0, clock=lambda: 0.0, sleep=lambda s: None)
+    return f.EdgarClient("UA", limiter, tmp_path, IQV_TODAY, get=sec.json, get_text=sec.text)
+
+
+def test_the_filed_type_finds_an_exhibit_its_name_does_not():
+    headers = (FIXTURES / f"edgar_index_headers_IQV_{IQV_RELEASE}.html").read_text()
+    assert f.declared_exhibit(headers, "EX-99.1") == "iqv-q3x2026earningspressre.htm"
+    assert f.declared_exhibit(headers, "EX-99.2") is None
+
+
+def test_iqv_release_is_read_through_its_declared_type(tmp_path):
+    block = f.earnings_release_block(iqv_edgar(tmp_path, IqvSec()), IQV_CIK,
+                                     IQV_SUBMISSIONS, IQV_TODAY, LAST_CYCLE)
+    assert block["source"].startswith(
+        "8-K filed 2026-10-27, item 2.02, exhibit iqv-q3x2026earningspressre.htm")
+    assert block["text"] == "IQVIA Reports Third-Quarter 2026 Results"
+
+
+def test_declared_types_are_fetched_once_then_cached(tmp_path):
+    sec = IqvSec()
+    for _ in range(2):
+        f.earnings_release_block(iqv_edgar(tmp_path, sec), IQV_CIK, IQV_SUBMISSIONS,
+                                 IQV_TODAY, LAST_CYCLE)
+    assert len(sec.urls) == 3  # index + headers + exhibit, first time only
+
+
+def test_no_99_1_by_name_or_by_type_is_still_a_lookup_failure(tmp_path):
+    sec = IqvSec(headers="&lt;TYPE&gt;8-K\n&lt;FILENAME&gt;iqv-20261027.htm\n")
+    with pytest.raises(f.LookupFailed, match="has no exhibit 99.1"):
+        f.earnings_release_block(iqv_edgar(tmp_path, sec), IQV_CIK, IQV_SUBMISSIONS,
+                                 IQV_TODAY, LAST_CYCLE)
 
 
 # --- wiring into symbol_block ------------------------------------------------------
